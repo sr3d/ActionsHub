@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+dist/
+*.png
+.DS_Store
+
+# Icon build artifacts — AppIcon.icns and the 1024 master are committed; the iconset is regenerated.
+Icon/AppIcon.iconset/
+!Icon/AppIcon-1024.png
