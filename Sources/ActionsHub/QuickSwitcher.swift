@@ -134,7 +134,9 @@ import AppKit
         let list = items
         guard list.indices.contains(index) else { return }
         switch list[index] {
-        case .repo(let name): model.selected = name
+        // Already on screen: just focus it. Otherwise place it in the focused pane.
+        case .repo(let name):
+            if model.panes.contains(name) { model.activate(name) } else { model.selected = name }
         case .external(let name): model.open(fullName: name)
         }
         close()

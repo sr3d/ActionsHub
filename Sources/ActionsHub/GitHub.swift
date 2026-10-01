@@ -162,6 +162,47 @@ enum RunState: Equatable {
     }
 }
 
+// MARK: - Pull requests
+
+struct PullRequest: Identifiable, Hashable {
+    let url: URL
+    let number: Int
+    let title: String
+    let repo: String
+    let author: String?
+    let isDraft: Bool
+    let updatedAt: Date
+    let branch: String
+    /// APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or nil when no review is required.
+    let reviewDecision: String?
+    /// Combined CI state of the head commit: SUCCESS, FAILURE, ERROR, PENDING, EXPECTED, or nil.
+    let ciState: String?
+
+    var id: URL { url }
+    var repoName: String { String(repo.split(separator: "/").last ?? Substring(repo)) }
+
+    var ci: RunState? {
+        switch ciState {
+        case "SUCCESS": .success
+        case "FAILURE", "ERROR": .failure
+        case "PENDING", "EXPECTED": .running
+        default: nil
+        }
+    }
+}
+
+/// Open PRs across a set of repos, plus which of them ask for the viewer's review.
+struct PullRequestSnapshot {
+    var viewer: String
+    var prs: [PullRequest]
+    /// Review requested from the viewer personally.
+    var direct: Set<URL>
+    /// Review requested from the viewer or one of their teams.
+    var anyRequest: Set<URL>
+    /// Repo chunks where GitHub had more open PRs than one page returns.
+    var truncated: Bool
+}
+
 // MARK: - Client
 
 struct GitHubError: LocalizedError {
@@ -293,8 +334,121 @@ actor GitHubClient {
         try await post("/repos/\(fullName)/actions/runs/\(run)/\(failedOnly ? "rerun-failed-jobs" : "rerun")")
     }
 
+    /// One GraphQL round trip for all open PRs across `repos`, with review state and CI status
+    /// (neither is available from the REST search API). Search queries are capped at 256
+    /// characters, so repos are split into chunks, each queried under its own alias.
+    func pullRequests(repos: [String]) async throws -> PullRequestSnapshot {
+        let base = "is:pr is:open archived:false sort:updated-desc"
+        var chunks: [[String]] = [[]]
+        for repo in repos {
+            let candidate = chunks[chunks.count - 1] + [repo]
+            let query = ([base] + candidate.map { "repo:\($0)" } + ["user-review-requested:@me"]).joined(separator: " ")
+            if query.count > 250, !chunks[chunks.count - 1].isEmpty { chunks.append([repo]) } else { chunks[chunks.count - 1] = candidate }
+        }
+        chunks.removeAll { $0.isEmpty }
+
+        var declarations: [String] = []
+        var fields = ["viewer { login }"]
+        var variables: [String: String] = [:]
+        for (i, chunk) in chunks.enumerated() {
+            let q = ([base] + chunk.map { "repo:\($0)" }).joined(separator: " ")
+            variables["q\(i)"] = q
+            variables["d\(i)"] = q + " user-review-requested:@me"
+            variables["r\(i)"] = q + " review-requested:@me"
+            declarations += ["$q\(i): String!", "$d\(i): String!", "$r\(i): String!"]
+            fields.append("s\(i): search(query: $q\(i), type: ISSUE, first: 100) { issueCount nodes { ...PR } }")
+            fields.append("d\(i): search(query: $d\(i), type: ISSUE, first: 100) { nodes { ... on PullRequest { url } } }")
+            fields.append("r\(i): search(query: $r\(i), type: ISSUE, first: 100) { nodes { ... on PullRequest { url } } }")
+        }
+        let query = """
+        query(\(declarations.joined(separator: ", "))) {
+          \(fields.joined(separator: "\n  "))
+        }
+        fragment PR on PullRequest {
+          number title url isDraft updatedAt headRefName reviewDecision
+          author { login }
+          repository { nameWithOwner }
+          commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        }
+        """
+
+        var req = request(url("/graphql"), method: "POST")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["query": query, "variables": variables])
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else { throw Self.error(from: data, status: status) }
+        let body = try Self.decoder.decode(GraphQLBody.self, from: data)
+        if let message = body.errors?.first?.message { throw GitHubError(message: message) }
+        let results = body.data ?? [:]
+
+        var snapshot = PullRequestSnapshot(viewer: results["viewer"]?.login ?? "", prs: [], direct: [], anyRequest: [], truncated: false)
+        var seen = Set<URL>()
+        for i in chunks.indices {
+            let page = results["s\(i)"]
+            if (page?.issueCount ?? 0) > (page?.nodes?.count ?? 0) { snapshot.truncated = true }
+            for node in page?.nodes ?? [] {
+                guard let pr = node.pullRequest, seen.insert(pr.url).inserted else { continue }
+                snapshot.prs.append(pr)
+            }
+            snapshot.direct.formUnion(results["d\(i)"]?.nodes?.compactMap(\.url) ?? [])
+            snapshot.anyRequest.formUnion(results["r\(i)"]?.nodes?.compactMap(\.url) ?? [])
+        }
+        snapshot.prs.sort { $0.updatedAt > $1.updatedAt }
+        return snapshot
+    }
+
     func cancel(_ fullName: String, run: Int) async throws {
         try await post("/repos/\(fullName)/actions/runs/\(run)/cancel")
+    }
+}
+
+// MARK: - GraphQL decoding
+
+/// Every top-level alias decodes into this loose shape: `viewer` fills `login`,
+/// searches fill `issueCount` / `nodes`.
+private struct GraphQLBody: Decodable {
+    struct Alias: Decodable {
+        let login: String?
+        let issueCount: Int?
+        let nodes: [PRNode]?
+    }
+    struct Message: Decodable { let message: String }
+    let data: [String: Alias]?
+    let errors: [Message]?
+}
+
+/// Search results can include non-PR nodes (decoded as `{}`), so every field is optional.
+private struct PRNode: Decodable {
+    struct Login: Decodable { let login: String }
+    struct Repository: Decodable { let nameWithOwner: String }
+    struct Commits: Decodable {
+        struct Node: Decodable {
+            struct Commit: Decodable {
+                struct Rollup: Decodable { let state: String? }
+                let statusCheckRollup: Rollup?
+            }
+            let commit: Commit
+        }
+        let nodes: [Node]?
+    }
+
+    let number: Int?
+    let title: String?
+    let url: URL?
+    let isDraft: Bool?
+    let updatedAt: Date?
+    let headRefName: String?
+    let reviewDecision: String?
+    let author: Login?
+    let repository: Repository?
+    let commits: Commits?
+
+    var pullRequest: PullRequest? {
+        guard let number, let title, let url, let repository, let updatedAt else { return nil }
+        return PullRequest(url: url, number: number, title: title, repo: repository.nameWithOwner,
+                           author: author?.login, isDraft: isDraft ?? false, updatedAt: updatedAt,
+                           branch: headRefName ?? "", reviewDecision: reviewDecision,
+                           ciState: commits?.nodes?.last?.commit.statusCheckRollup?.state)
     }
 }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Lays the current group's panes out as a rows × cols grid.
 @MainActor struct DetailView: View {
@@ -65,13 +66,34 @@ import SwiftUI
     }
 }
 
-/// Placeholder for an unassigned pane: one click on a repo fills this pane.
+/// Placeholder for an empty pane. With one pane: pick a repo to browse. With several,
+/// panes follow the group's order, so an empty cell just means the group needs more repos.
 @MainActor private struct EmptyPane: View {
     @Environment(\.zoom) private var z
     @Environment(AppModel.self) private var model
     let index: Int
 
     var body: some View {
+        if model.isSinglePane { picker } else { addPrompt }
+    }
+
+    private var addPrompt: some View {
+        VStack(spacing: 10 * z) {
+            Text("Pane \(index + 1)").zFont(.title3)
+            Text("Panes show this group's repos in sidebar order.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+            Button("Add a repository to the group… (⇧⌘K)") { model.openSwitcher(adding: true) }
+                .buttonStyle(.link)
+            Text("or drag one here from the sidebar")
+                .zFont(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(20 * z)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var picker: some View {
         VStack(spacing: 10 * z) {
             Text("Show a repository here").zFont(.title3)
             if model.pinned.isEmpty {
@@ -133,6 +155,8 @@ import SwiftUI
     let repo: String
     let pane: Int
     @State private var showFilter = false
+    /// Share of the pane height given to the PR subpane.
+    @AppStorage("prSubpaneFraction") private var prFraction: Double = 0.4
 
     private var allRuns: [WorkflowRun] { model.runs[repo] ?? [] }
     private var workflowNames: [String] { Array(Set(allRuns.map(\.workflowFile))).sorted() }
@@ -153,31 +177,48 @@ import SwiftUI
             if let err = model.runsError[repo] {
                 Banner(text: err, color: .red, onClose: nil)
             }
-            if allRuns.isEmpty {
-                Group {
-                    if model.runsLoading.contains(repo) || model.lastUpdated[repo] == nil {
-                        ProgressView()
-                    } else {
-                        Text("No workflow runs").foregroundStyle(.secondary)
+            if model.prSubpaneRepos.contains(repo) {
+                // Runs on top, this repo's PRs below; drag the divider to resize.
+                GeometryReader { geo in
+                    VStack(spacing: 0) {
+                        runsArea
+                            .frame(height: geo.size.height * (1 - prFraction))
+                        RowResizeHandle(fraction: $prFraction, totalHeight: geo.size.height)
+                        RepoPRSubpane(repo: repo)
+                            .frame(maxHeight: .infinity)
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if visibleRuns.isEmpty {
-                VStack(spacing: 8 * z) {
-                    Image(systemName: "checkmark.seal.fill").font(.system(size: 34 * z)).foregroundStyle(.green)
-                    Text("Nothing needs attention").zFont(.title3)
-                    Text("\(allRuns.count) recent runs hidden").foregroundStyle(.secondary)
-                    Button("Show all runs") { model.showAllRuns = true }.buttonStyle(.link)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    TimelineView(.periodic(from: .now, by: 5)) { _ in
-                        LazyVStack(spacing: 0) {
-                            ForEach(visibleRuns) { run in
-                                RunRow(repo: repo, run: run)
-                                Divider()
-                            }
+                runsArea
+            }
+        }
+    }
+
+    @ViewBuilder private var runsArea: some View {
+        if allRuns.isEmpty {
+            Group {
+                if model.runsLoading.contains(repo) || model.lastUpdated[repo] == nil {
+                    ProgressView()
+                } else {
+                    Text("No workflow runs").foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if visibleRuns.isEmpty {
+            VStack(spacing: 8 * z) {
+                Image(systemName: "checkmark.seal.fill").font(.system(size: 34 * z)).foregroundStyle(.green)
+                Text("Nothing needs attention").zFont(.title3)
+                Text("\(allRuns.count) recent runs hidden").foregroundStyle(.secondary)
+                Button("Show all runs") { model.showAllRuns = true }.buttonStyle(.link)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                TimelineView(.periodic(from: .now, by: 5)) { _ in
+                    LazyVStack(spacing: 0) {
+                        ForEach(visibleRuns) { run in
+                            RunRow(repo: repo, run: run)
+                            Divider()
                         }
                     }
                 }
@@ -187,6 +228,7 @@ import SwiftUI
 
     private var header: some View {
         HStack(spacing: 12 * z) {
+            ColorSwatch(repo: repo)
             VStack(alignment: .leading, spacing: 2 * z) {
                 Text(repo.split(separator: "/").last.map(String.init) ?? repo)
                     .zFont(.title3, weight: .semibold).lineLimit(1)
@@ -198,10 +240,14 @@ import SwiftUI
             }
             Spacer()
             Button { showFilter.toggle() } label: {
-                HStack(spacing: 4 * z) {
-                    Image(systemName: "line.3.horizontal.decrease")
-                    Text(filter ?? "All workflows").lineLimit(1)
-                    Image(systemName: "chevron.down").zFont(.caption2)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 4 * z) {
+                        Image(systemName: "line.3.horizontal.decrease")
+                        Text(filter ?? "All workflows")
+                        Image(systemName: "chevron.down").zFont(.caption2)
+                    }
+                    .fixedSize()
+                    Image(systemName: filter == nil ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
                 }
                 .zFont(.callout)
             }
@@ -227,13 +273,117 @@ import SwiftUI
             } else {
                 HeaderButton(symbol: "arrow.clockwise", help: "Refresh (⌘R)") { Task { await model.refreshRuns(repo) } }
             }
+            PRLinkButton(repo: repo)
             HeaderButton(symbol: "safari", help: "Open in browser (⇧⌘O)") { model.openInBrowser(model.url(for: repo)) }
-            if model.panes.count > 1 {
+            if model.isSinglePane {
                 HeaderButton(symbol: "xmark", help: "Clear this pane") { model.clearPane(pane) }
             }
         }
         .padding(.horizontal, 16 * z)
         .padding(.vertical, 10 * z)
+        .background {
+            // The repo's color tints the header and draws a bar across the top of the pane.
+            if let color = model.color(for: repo)?.color {
+                color.opacity(0.16)
+                    .overlay(alignment: .top) { color.frame(height: 4 * z) }
+            }
+        }
+    }
+}
+
+/// Open PRs for the repo; toggles the pane's PR subpane.
+@MainActor private struct PRLinkButton: View {
+    @Environment(\.zoom) private var z
+    @Environment(AppModel.self) private var model
+    let repo: String
+
+    var body: some View {
+        let open = model.prSubpaneRepos.contains(repo)
+        Button {
+            model.togglePRSubpane(repo)
+        } label: {
+            HStack(spacing: 3 * z) {
+                Image(systemName: "arrow.triangle.pull")
+                if let n = model.openPRCount(in: repo), n > 0 {
+                    Text("\(n)").monospacedDigit()
+                }
+                let reviews = model.reviewRequestCount(in: repo)
+                if reviews > 0 {
+                    Text("\(reviews)")
+                        .zFont(.caption2, weight: .bold)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4 * z)
+                        .background(Capsule().fill(Color.blue))
+                }
+            }
+            .frame(height: 22 * z)
+            .padding(.horizontal, 4 * z)
+            .background(RoundedRectangle(cornerRadius: 5 * z).fill(open ? Color.accentColor.opacity(0.2) : .clear))
+            .fixedSize()
+        }
+        .buttonStyle(.borderless)
+        .help((open ? "Hide" : "Show") + " pull requests" + (model.reviewRequestCount(in: repo) > 0 ? " — \(model.reviewRequestCount(in: repo)) waiting for your review" : ""))
+    }
+}
+
+/// Color dot at the start of a pane header; click to pick the repo's color.
+@MainActor struct ColorSwatch: View {
+    @Environment(\.zoom) private var z
+    @Environment(AppModel.self) private var model
+    let repo: String
+    @State private var open = false
+
+    var body: some View {
+        Button { open.toggle() } label: {
+            Group {
+                if let color = model.color(for: repo)?.color {
+                    Circle().fill(color)
+                } else {
+                    Circle().strokeBorder(Color.secondary.opacity(0.6), style: StrokeStyle(lineWidth: 1.5 * z, dash: [3 * z, 2 * z]))
+                }
+            }
+            .frame(width: 14 * z, height: 14 * z)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help("Pane color")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            ColorPalette(selected: model.color(for: repo)) { choice in
+                model.setColor(choice, for: repo)
+                open = false
+            }
+            .environment(\.zoom, z)
+        }
+    }
+}
+
+@MainActor struct ColorPalette: View {
+    @Environment(\.zoom) private var z
+    let selected: RepoColor?
+    let pick: (RepoColor?) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8 * z) {
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(26 * z), spacing: 6 * z), count: 6), spacing: 6 * z) {
+                ForEach(RepoColor.allCases, id: \.self) { c in
+                    Circle()
+                        .fill(c.color)
+                        .frame(width: 22 * z, height: 22 * z)
+                        .overlay {
+                            if c == selected {
+                                Image(systemName: "checkmark").zFont(.caption, weight: .bold).foregroundStyle(.white)
+                            }
+                        }
+                        .contentShape(Circle())
+                        .onTapGesture { pick(c) }
+                        .help(c.name)
+                }
+            }
+            Button("No color") { pick(nil) }
+                .buttonStyle(.link)
+                .zFont(.callout)
+        }
+        .padding(12 * z)
     }
 }
 
@@ -307,6 +457,26 @@ import SwiftUI
 
     private var expanded: Bool { model.expandedRuns.contains(run.id) }
 
+    private func metaLine(workflow: Bool, extras: Bool) -> some View {
+        HStack(spacing: 6 * z) {
+            if workflow { Text(run.workflowLabel) }
+            Text("#\(run.runNumber)")
+            if extras, let attempt = run.runAttempt, attempt > 1 { Text("attempt \(attempt)") }
+            if let branch = run.headBranch {
+                Text(branch)
+                    .zFont(.caption, design: .monospaced)
+                    .padding(.horizontal, 5 * z)
+                    .padding(.vertical, 1 * z)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+            }
+            if extras {
+                Text(run.event)
+                if let actor = run.actor { Text("· \(actor.login)") }
+            }
+        }
+        .fixedSize()
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 10 * z) {
@@ -321,21 +491,26 @@ import SwiftUI
                     Text(run.title)
                         .fontWeight(.medium)
                         .lineLimit(1)
-                    HStack(spacing: 6 * z) {
-                        Text(run.workflowLabel).lineLimit(1)
-                        Text("#\(run.runNumber)")
-                        if let attempt = run.runAttempt, attempt > 1 { Text("attempt \(attempt)") }
-                        if let branch = run.headBranch {
-                            Text(branch)
-                                .zFont(.caption, design: .monospaced)
-                                .lineLimit(1)
-                                .padding(.horizontal, 5 * z)
-                                .padding(.vertical, 1 * z)
-                                .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                    // Narrow panes drop details instead of squashing them: the fullest
+                    // variant that fits wins.
+                    ViewThatFits(in: .horizontal) {
+                        metaLine(workflow: true, extras: true)
+                        metaLine(workflow: true, extras: false)
+                        metaLine(workflow: false, extras: false)
+                        // Last resort (always used if nothing above fits): trim the branch in the middle.
+                        HStack(spacing: 6 * z) {
+                            Text("#\(run.runNumber)").fixedSize()
+                            if let branch = run.headBranch {
+                                Text(branch)
+                                    .zFont(.caption, design: .monospaced)
+                                    .truncationMode(.middle)
+                                    .padding(.horizontal, 5 * z)
+                                    .padding(.vertical, 1 * z)
+                                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                            }
                         }
-                        Text(run.event)
-                        if let actor = run.actor { Text("· \(actor.login)").lineLimit(1) }
                     }
+                    .lineLimit(1)
                     .zFont(.caption)
                     .foregroundStyle(.secondary)
                 }
@@ -470,5 +645,76 @@ enum Format {
         if s < 60 { return "\(s)s" }
         if s < 3600 { return "\(s / 60)m \(s % 60)s" }
         return "\(s / 3600)h \((s % 3600) / 60)m"
+    }
+}
+
+/// A repo pane's own PR list: just this repo's PRs, bucketed like the docked panel.
+@MainActor private struct RepoPRSubpane: View {
+    @Environment(\.zoom) private var z
+    @Environment(AppModel.self) private var model
+    let repo: String
+
+    var body: some View {
+        let sections = model.prSections(repo: repo)
+        let total = sections.reduce(0) { $0 + $1.1.count }
+        VStack(spacing: 0) {
+            HStack(spacing: 8 * z) {
+                Image(systemName: "arrow.triangle.pull")
+                Text("Pull requests").fontWeight(.semibold)
+                Text("\(total)").foregroundStyle(.secondary)
+                Spacer()
+                Button { model.openInBrowser(URL(string: "https://github.com/\(repo)/pulls")!) } label: {
+                    Image(systemName: "safari")
+                }
+                .buttonStyle(.borderless)
+                .help("Open pull requests on GitHub")
+                Button { model.togglePRSubpane(repo) } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless)
+                    .help("Hide pull requests")
+            }
+            .zFont(.callout)
+            .padding(.horizontal, 12 * z)
+            .padding(.vertical, 6 * z)
+            .background(model.color(for: repo)?.color.opacity(0.10) ?? Color.primary.opacity(0.04))
+            Divider()
+            if model.prSnapshot == nil {
+                ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if sections.isEmpty {
+                Text(model.prIncludeStale && model.prIncludeDrafts ? "No open pull requests"
+                     : "No open pull requests (drafts and PRs idle 30+ days hidden)")
+                    .zFont(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(12 * z)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                PRSectionsList(sections: sections, showRepo: false)
+            }
+        }
+    }
+}
+
+/// Horizontal divider that resizes a vertical split by fraction of `totalHeight`.
+@MainActor private struct RowResizeHandle: View {
+    @Binding var fraction: Double
+    let totalHeight: CGFloat
+    @State private var start: Double?
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.15))
+            .frame(height: 1)
+            .overlay(Color.clear.frame(height: 8).contentShape(Rectangle()))
+            .onHover { inside in
+                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    let base = start ?? fraction
+                    start = base
+                    guard totalHeight > 0 else { return }
+                    fraction = min(max(base - value.translation.height / totalHeight, 0.15), 0.85)
+                }
+                .onEnded { _ in start = nil })
     }
 }

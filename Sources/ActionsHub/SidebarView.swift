@@ -10,6 +10,16 @@ import SwiftUI
             HStack(spacing: 6 * z) {
                 GroupPicker()
                 LayoutPicker()
+                Button { model.showPRs.toggle() } label: {
+                    Image(systemName: "arrow.triangle.pull")
+                        .foregroundStyle(model.showPRs ? Color.white : Color.primary)
+                        .frame(width: 30 * z, height: 30 * z)
+                        .background(RoundedRectangle(cornerRadius: 7 * z)
+                            .fill(model.showPRs ? Color.accentColor : Color.primary.opacity(0.06)))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Pull requests (⇧⌘P)")
             }
             .padding(.horizontal, 10 * z)
             .padding(.top, 10 * z)
@@ -21,8 +31,13 @@ import SwiftUI
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1 * z) {
+                    let cells = model.panes.count
                     ForEach(Array(model.pinned.enumerated()), id: \.element) { i, name in
+                        if !model.isSinglePane && i == cells {
+                            OverflowDivider()
+                        }
                         RepoRow(fullName: name, shortcut: i < 9 ? i + 1 : nil)
+                            .opacity(!model.isSinglePane && i >= cells ? 0.55 : 1)
                     }
                     if model.pinned.isEmpty {
                         VStack(alignment: .leading, spacing: 6 * z) {
@@ -248,6 +263,7 @@ import SwiftUI
             StatusDot(state: model.summary(for: fullName))
             VStack(alignment: .leading, spacing: 1 * z) {
                 Text(name).lineLimit(1)
+                    .foregroundStyle(!isSelected ? (model.color(for: fullName)?.color ?? .primary) : .white)
                 Text(owner).zFont(.caption).foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary).lineLimit(1)
             }
             Spacer(minLength: 4 * z)
@@ -259,6 +275,11 @@ import SwiftUI
                             .help("\(n) \(kind.label.lowercased())")
                     }
                 }
+                let reviews = model.reviewRequestCount(in: fullName)
+                if reviews > 0 {
+                    CountBadge(count: reviews, color: .blue, selected: isSelected)
+                        .help("\(reviews) pull request\(reviews == 1 ? "" : "s") waiting for your review")
+                }
             }
             if let shortcut {
                 Text("⌘\(shortcut)").zFont(.caption2, design: .monospaced)
@@ -267,6 +288,11 @@ import SwiftUI
         }
         .padding(.horizontal, 8 * z)
         .padding(.vertical, 5 * z)
+        .overlay(alignment: .leading) {
+            if let color = model.color(for: fullName)?.color {
+                Capsule().fill(color).frame(width: 3 * z).padding(.vertical, 6 * z)
+            }
+        }
         .foregroundStyle(isSelected ? .white : .primary)
         .background(
             RoundedRectangle(cornerRadius: 6 * z)
@@ -280,7 +306,7 @@ import SwiftUI
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { model.selected = fullName }
+        .onTapGesture { model.activate(fullName) }
         .onHover { hovering = $0 }
         .draggable(fullName)
         .dropDestination(for: String.self) { items, _ in
@@ -292,10 +318,36 @@ import SwiftUI
             Button("Move Up") { model.movePin(fullName, by: -1) }
             Button("Move Down") { model.movePin(fullName, by: 1) }
             Divider()
+            Menu("Color") {
+                ForEach(RepoColor.allCases, id: \.self) { c in
+                    Toggle(c.name, isOn: Binding(get: { model.color(for: fullName) == c },
+                                                 set: { _ in model.setColor(c, for: fullName) }))
+                }
+                Divider()
+                Button("No Color") { model.setColor(nil, for: fullName) }
+            }
+            Divider()
             Button("Open Actions in Browser") { model.openInBrowser(model.url(for: fullName)) }
+            Button("Open Pull Requests in Browser") { model.openInBrowser(URL(string: "https://github.com/\(fullName)/pulls")!) }
             Divider()
             Button("Remove from Group") { model.togglePin(fullName) }
         }
+    }
+}
+
+/// Separates the repos shown in the pane grid from the ones that don't fit.
+@MainActor private struct OverflowDivider: View {
+    @Environment(\.zoom) private var z
+
+    var body: some View {
+        HStack(spacing: 6 * z) {
+            Rectangle().fill(Color.secondary.opacity(0.3)).frame(height: 1)
+            Text("Not in layout").zFont(.caption2).foregroundStyle(.secondary).fixedSize()
+            Rectangle().fill(Color.secondary.opacity(0.3)).frame(height: 1)
+        }
+        .padding(.horizontal, 8 * z)
+        .padding(.vertical, 6 * z)
+        .help("The pane grid shows the group's first repos in order. Drag a repo above this line, or pick a bigger layout, to show it.")
     }
 }
 

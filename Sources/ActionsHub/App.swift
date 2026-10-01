@@ -36,6 +36,9 @@ struct ActionsHubApp: App {
                     }
                 }
                 Divider()
+                Toggle("Show Pull Requests", isOn: Binding(get: { model.showPRs }, set: { model.showPRs = $0 }))
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                Divider()
                 Toggle("Show All Runs", isOn: Binding(get: { model.showAllRuns }, set: { model.showAllRuns = $0 }))
                     .keyboardShortcut("a", modifiers: [.command, .shift])
                 ForEach(Attention.allCases, id: \.self) { kind in
@@ -176,6 +179,7 @@ extension View {
 @MainActor struct RootView: View {
     @Environment(\.zoom) private var z
     @Environment(AppModel.self) private var model
+    @AppStorage("prPaneWidth") private var prWidth: Double = 380
 
     var body: some View {
         ZStack {
@@ -192,6 +196,11 @@ extension View {
                     Divider()
                     DetailView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if model.showPRs {
+                        ResizeHandle(width: $prWidth, range: 280...800)
+                        PullRequestsView()
+                            .frame(width: prWidth * z)
+                    }
                 }
             }
             if model.showSwitcher {

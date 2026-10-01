@@ -4,7 +4,7 @@
 //
 //   swift Icon/generate-icon.swift
 //
-// Concept: a deep-navy macOS "squircle" holding a 2×2 grid of panes (the app's
+// Concept: a bright blue macOS "squircle" holding a 2×2 grid of panes (the app's
 // split view). Each pane has a few "run rows" and one status light — passed,
 // running, awaiting approval, failed — the four states the app watches.
 
@@ -40,18 +40,18 @@ func makeIcon(size S: CGFloat) -> CGImage {
     ctx.fillPath()
     ctx.restoreGState()
 
-    // Navy → slate gradient, clipped to the squircle.
+    // Sky → royal blue gradient, clipped to the squircle.
     ctx.saveGState()
     ctx.addPath(squircle)
     ctx.clip()
     let grad = CGGradient(colorsSpace: cs,
-                          colors: [rgb(0.16, 0.20, 0.33), rgb(0.07, 0.09, 0.16)] as CFArray,
+                          colors: [rgb(0.36, 0.66, 1.00), rgb(0.20, 0.36, 0.90)] as CFArray,
                           locations: [0, 1])!
     ctx.drawLinearGradient(grad, start: CGPoint(x: 0, y: body.maxY),
                            end: CGPoint(x: 0, y: body.minY), options: [])
     // Subtle top sheen for depth.
     let sheen = CGGradient(colorsSpace: cs,
-                           colors: [rgb(1, 1, 1, 0.10), rgb(1, 1, 1, 0)] as CFArray,
+                           colors: [rgb(1, 1, 1, 0.22), rgb(1, 1, 1, 0)] as CFArray,
                            locations: [0, 1])!
     ctx.drawLinearGradient(sheen, start: CGPoint(x: body.midX, y: body.maxY),
                            end: CGPoint(x: body.midX, y: body.midY), options: [])
@@ -78,11 +78,14 @@ func makeIcon(size S: CGFloat) -> CGImage {
                           y: grid.maxY - paneH - row * (paneH + gap),
                           width: paneW, height: paneH)
         let panePath = CGPath(roundedRect: pane, cornerWidth: 34 * u, cornerHeight: 34 * u, transform: nil)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -6 * u), blur: 18 * u, color: rgb(0.05, 0.12, 0.35, 0.28))
         ctx.addPath(panePath)
-        ctx.setFillColor(rgb(1, 1, 1, 0.09))
+        ctx.setFillColor(rgb(1, 1, 1, 0.96))
         ctx.fillPath()
+        ctx.restoreGState()
         ctx.addPath(panePath)
-        ctx.setStrokeColor(rgb(1, 1, 1, 0.14))
+        ctx.setStrokeColor(rgb(1, 1, 1, 1))
         ctx.setLineWidth(3 * u)
         ctx.strokePath()
 
@@ -90,7 +93,7 @@ func makeIcon(size S: CGFloat) -> CGImage {
         let dotR: CGFloat = 34 * u
         let dot = CGPoint(x: pane.minX + 44 * u + dotR, y: pane.maxY - 44 * u - dotR)
         ctx.saveGState()
-        ctx.setShadow(offset: .zero, blur: 38 * u, color: lights[i].copy(alpha: 0.85))
+        ctx.setShadow(offset: .zero, blur: 26 * u, color: lights[i].copy(alpha: 0.6))
         ctx.setFillColor(lights[i])
         ctx.fillEllipse(in: CGRect(x: dot.x - dotR, y: dot.y - dotR, width: dotR * 2, height: dotR * 2))
         ctx.restoreGState()
@@ -100,13 +103,13 @@ func makeIcon(size S: CGFloat) -> CGImage {
         func bar(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ alpha: CGFloat) {
             let r = CGRect(x: x, y: y - barH / 2, width: w, height: barH)
             ctx.addPath(CGPath(roundedRect: r, cornerWidth: barH / 2, cornerHeight: barH / 2, transform: nil))
-            ctx.setFillColor(rgb(1, 1, 1, alpha))
+            ctx.setFillColor(rgb(0.22, 0.32, 0.55, alpha))
             ctx.fillPath()
         }
         let textX = dot.x + dotR + 26 * u
         bar(textX, dot.y, pane.maxX - 44 * u - textX, 0.55)
-        bar(pane.minX + 44 * u, dot.y - 92 * u, paneW - 88 * u, 0.22)
-        bar(pane.minX + 44 * u, dot.y - 150 * u, paneW * 0.55, 0.22)
+        bar(pane.minX + 44 * u, dot.y - 92 * u, paneW - 88 * u, 0.20)
+        bar(pane.minX + 44 * u, dot.y - 150 * u, paneW * 0.55, 0.20)
     }
 
     return ctx.makeImage()!
