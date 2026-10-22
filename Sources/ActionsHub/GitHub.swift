@@ -15,6 +15,7 @@ struct Repo: Codable, Identifiable, Hashable {
     let htmlUrl: URL
     let pushedAt: Date?
     let archived: Bool?
+    let defaultBranch: String?
     /// What the fetching account may do here; used to pick between accounts that both see a repo.
     let permissions: Permissions?
 
@@ -64,11 +65,26 @@ struct WorkflowRun: Decodable, Identifiable, Hashable {
 
     /// Elapsed time; nil for runs that haven't started (queued or parked on an approval gate),
     /// where it would just count how long they've been sitting there.
+    /// Held because it comes from an outside contributor's fork, not by an environment's
+    /// reviewers: approved with `approveRun`, not through pending deployments.
+    var needsForkApproval: Bool { status == "action_required" || conclusion == "action_required" }
+
     var duration: TimeInterval? {
         guard state != .waiting, state != .queued, let start = runStartedAt else { return nil }
         let end = state.isActive ? Date() : updatedAt
         return max(0, end.timeIntervalSince(start))
     }
+}
+
+/// An environment a run is waiting on (`GET …/runs/{id}/pending_deployments`).
+struct PendingDeployment: Decodable, Hashable {
+    struct Environment: Decodable, Hashable {
+        let id: Int
+        let name: String?
+    }
+    let environment: Environment
+    /// Whether this token's user is one of the environment's required reviewers.
+    let currentUserCanApprove: Bool
 }
 
 struct JobsPage: Decodable {
@@ -98,8 +114,77 @@ struct Step: Decodable, Hashable {
     let status: String?
     let conclusion: String?
     let number: Int
+    let startedAt: Date?
+    let completedAt: Date?
 
     var state: RunState { RunState(status: status, conclusion: conclusion) }
+
+    var duration: TimeInterval? {
+        guard let start = startedAt else { return nil }
+        return max(0, (completedAt ?? Date()).timeIntervalSince(start))
+    }
+}
+
+/// A check-run annotation: an error or warning tied to a file and line.
+struct CheckAnnotation: Decodable, Hashable {
+    let path: String
+    let startLine: Int?
+    let annotationLevel: String?
+    let title: String?
+    let message: String
+
+    var isFailure: Bool { annotationLevel == "failure" }
+    /// "src/app.ts:42"; the job itself when GitHub has no file (".github").
+    var location: String? {
+        guard path != ".github", !path.isEmpty else { return nil }
+        guard let line = startLine, line > 0 else { return path }
+        return "\(path):\(line)"
+    }
+}
+
+/// The part of a job's log worth reading in the app: around the first error, or the end.
+struct LogExcerpt: Hashable {
+    var lines: [String]
+    /// Index in `lines` of the first error line.
+    var errorLine: Int?
+    var totalLines: Int
+
+    static let before = 120, after = 30, tail = 200
+
+    /// Strips timestamps and color codes, then keeps the lines around the first `##[error]`
+    /// (or the last lines, if there's none). Runs off the main thread: logs can be megabytes.
+    static func make(from text: String) -> LogExcerpt {
+        var all = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if all.last?.isEmpty == true { all.removeLast() }
+        let firstError = all.firstIndex { $0.contains("##[error]") }
+        let range: Range<Int>
+        if let firstError {
+            range = max(0, firstError - before)..<min(all.count, firstError + after)
+        } else {
+            range = max(0, all.count - tail)..<all.count
+        }
+        let lines = all[range].map { clean($0) }
+        return LogExcerpt(lines: lines, errorLine: firstError.map { $0 - range.lowerBound }, totalLines: all.count)
+    }
+
+    /// "2024-05-01T10:00:00.1234567Z ##[error]boom" → "error: boom"; drops ANSI escapes.
+    private static func clean(_ line: Substring) -> String {
+        var s = line
+        if s.count > 29, s[s.startIndex].isNumber, let space = s.firstIndex(of: " "), s[s.index(before: space)] == "Z" {
+            s = s[s.index(after: space)...]
+        }
+        var out = String(s).replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
+        for (marker, label) in [("##[error]", "error: "), ("##[warning]", "warning: "), ("##[group]", "▸ "), ("##[endgroup]", ""), ("##[debug]", "debug: ")] {
+            if out.hasPrefix(marker) { out = label + out.dropFirst(marker.count) }
+        }
+        return out
+    }
+}
+
+/// Stops at a redirect instead of following it, so the token isn't sent to the log store.
+private final class NoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest) async -> URLRequest? { nil }
 }
 
 /// Collapses GitHub's separate `status` / `conclusion` fields into one displayable state.
@@ -293,8 +378,13 @@ actor GitHubClient {
         return try Self.decoder.decode(T.self, from: data)
     }
 
-    func post(_ path: String) async throws {
-        let (data, response) = try await URLSession.shared.data(for: request(url(path), method: "POST"))
+    func post(_ path: String, body: [String: Any]? = nil) async throws {
+        var req = request(url(path), method: "POST")
+        if let body {
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        let (data, response) = try await URLSession.shared.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else { throw Self.error(from: data, response: response) }
     }
@@ -351,6 +441,37 @@ actor GitHubClient {
         }
         var seen = Set<Int>()
         return all.filter { seen.insert($0.id).inserted }.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    func workflows(_ fullName: String) async throws -> [Workflow] {
+        try await get(WorkflowsPage.self, "/repos/\(fullName)/actions/workflows?per_page=100").workflows
+    }
+
+    /// A text file's contents at `ref` (for a workflow's inputs).
+    func fileText(_ fullName: String, path: String, ref: String) async throws -> String {
+        struct Contents: Decodable { let content: String? }
+        let encodedPath = path.split(separator: "/").map { String($0).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }.joined(separator: "/")
+        let encodedRef = ref.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? ref
+        let file = try await get(Contents.self, "/repos/\(fullName)/contents/\(encodedPath)?ref=\(encodedRef)")
+        guard let base64 = file.content, let data = Data(base64Encoded: base64.replacingOccurrences(of: "\n", with: "")) else {
+            throw GitHubError(message: "Couldn't read \(path)")
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Starts a workflow by hand (`workflow_dispatch`).
+    func dispatch(_ fullName: String, workflow: Int, ref: String, inputs: [String: String]) async throws {
+        try await post("/repos/\(fullName)/actions/workflows/\(workflow)/dispatches", body: ["ref": ref, "inputs": inputs])
+    }
+
+    /// The last 100 finished runs, for trends. Fetched only when trends are opened.
+    func runHistory(_ fullName: String) async throws -> [WorkflowRun] {
+        try await get(RunsPage.self, "/repos/\(fullName)/actions/runs?per_page=100&status=completed").workflowRuns
+    }
+
+    /// Jobs of an earlier attempt of a run (the one before a green re-run, for flaky jobs).
+    func attemptJobs(_ fullName: String, run: Int, attempt: Int) async throws -> [Job] {
+        try await get(JobsPage.self, "/repos/\(fullName)/actions/runs/\(run)/attempts/\(attempt)/jobs?per_page=100").jobs
     }
 
     func jobs(_ fullName: String, run: Int) async throws -> [Job] {
@@ -427,6 +548,53 @@ actor GitHubClient {
 
     func cancel(_ fullName: String, run: Int) async throws {
         try await post("/repos/\(fullName)/actions/runs/\(run)/cancel")
+    }
+
+    private static let noRedirect = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
+
+    /// A job's log, trimmed to the part worth reading. GitHub answers with a redirect to a
+    /// signed URL that rejects our token, so the redirect is followed without it.
+    func jobLog(_ fullName: String, job: Int) async throws -> LogExcerpt {
+        let endpoint = url("/repos/\(fullName)/actions/jobs/\(job)/logs")
+        let (data, response) = try await Self.noRedirect.data(for: request(endpoint))
+        guard let http = response as? HTTPURLResponse else { throw GitHubError(message: "No response") }
+        var body = data
+        if (300..<400).contains(http.statusCode) {
+            guard let location = http.value(forHTTPHeaderField: "Location"), let signed = URL(string: location, relativeTo: endpoint)?.absoluteURL else {
+                throw GitHubError(message: "Log redirect without a location")
+            }
+            let (logData, logResponse) = try await URLSession.shared.data(from: signed)
+            guard (logResponse as? HTTPURLResponse)?.statusCode == 200 else {
+                let status = (logResponse as? HTTPURLResponse)?.statusCode ?? 0
+                throw GitHubError(message: "Couldn't download the log (\(status))", status: status)
+            }
+            body = logData
+        } else if !(200..<300).contains(http.statusCode) {
+            throw Self.error(from: data, response: response)
+        }
+        return LogExcerpt.make(from: String(decoding: body, as: UTF8.self))
+    }
+
+    /// Errors and warnings with file and line. An Actions job's id is also its check run's id.
+    func annotations(_ fullName: String, job: Int) async throws -> [CheckAnnotation] {
+        try await get([CheckAnnotation].self, "/repos/\(fullName)/check-runs/\(job)/annotations?per_page=50")
+    }
+
+    /// Environments a run is parked on. Unchanged lists come back 304 via ETag.
+    func pendingDeployments(_ fullName: String, run: Int) async throws -> [PendingDeployment] {
+        try await get([PendingDeployment].self, "/repos/\(fullName)/actions/runs/\(run)/pending_deployments")
+    }
+
+    /// Approves or rejects a run's deployments to the given environments.
+    func reviewDeployments(_ fullName: String, run: Int, environments: [Int], approve: Bool) async throws {
+        try await post("/repos/\(fullName)/actions/runs/\(run)/pending_deployments",
+                       body: ["environment_ids": environments, "state": approve ? "approved" : "rejected",
+                              "comment": approve ? "Approved from ActionsHub" : "Rejected from ActionsHub"])
+    }
+
+    /// Lets a run from an outside contributor's fork go ahead (it's held before any job starts).
+    func approveRun(_ fullName: String, run: Int) async throws {
+        try await post("/repos/\(fullName)/actions/runs/\(run)/approve")
     }
 }
 

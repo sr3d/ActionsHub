@@ -6,6 +6,7 @@ struct ActionsHubApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
     @AppStorage("zoom") private var zoom: Double = 1.0
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         Window("ActionsHub", id: "main") {
@@ -13,13 +14,77 @@ struct ActionsHubApp: App {
                 .environment(\.zoom, zoom)
                 .environment(model)
             .frame(minWidth: 720 * zoom, minHeight: 420 * zoom)
-            .onAppear { model.start(); ResizeBench.runIfRequested() }
+            .onAppear {
+                model.start()
+                ResizeBench.extraShots = { [model] dir in
+                    // Alert editors for the group, a repo and a run, then the alert list. Nothing is saved.
+                    var targets: [(String, AlertTarget)] = [("alerts-group", .group(model.currentGroupID))]
+                    if let repo = model.pinned.first {
+                        targets.append(("alerts-repo", .repo(repo)))
+                        if let run = model.runs[repo]?.first { targets.append(("alerts-run", .run(repo: repo, run: run))) }
+                    }
+                    @MainActor func next(_ i: Int) async {
+                        guard i < targets.count else {
+                            openWindow(id: "alerts")
+                            try? await Task.sleep(for: .seconds(1))
+                            ResizeBench.capture("alert-list", in: dir)
+                            exit(0)
+                        }
+                        model.alerts.editing = targets[i].1
+                        try? await Task.sleep(for: .seconds(1))
+                        ResizeBench.capture(targets[i].0, in: dir)
+                        model.alerts.editing = nil
+                        try? await Task.sleep(for: .seconds(0.7))
+                        await next(i + 1)
+                    }
+                    Task { @MainActor in
+                        // A failed run expanded, with its log.
+                        if let (repo, run) = model.visibleRepos.lazy.compactMap({ r in model.attentionRuns(for: r).first { $0.state == .failure && ($0.duration ?? 0) > 30 }.map { (r, $0) } }).first {
+                            if let window = NSApp.windows.first(where: { $0.title == "ActionsHub" }) {
+                                window.setFrame(NSRect(x: window.frame.minX, y: window.frame.minY, width: 2400, height: 1400), display: true)
+                            }
+                            model.toggleExpanded(repo: repo, run: run.id)
+                            try? await Task.sleep(for: .seconds(8))
+                            ResizeBench.captureMain("failed-run-log", in: dir)
+                            for job in model.jobs[run.id] ?? [] {
+                                let log = model.jobLogs[job.id]
+                                let excerpt = log?.excerpt
+                                let errorText = excerpt.flatMap { e in e.errorLine.map { e.lines[$0] } } ?? "-"
+                                FileHandle.standardError.write("LOG \(job.name) \(job.state): \(excerpt?.lines.count ?? -1)/\(excerpt?.totalLines ?? -1) lines, error: \(errorText), note: \(log?.note ?? "-"), annotations: \(log?.annotations.count ?? -1)\n".data(using: .utf8)!)
+                            }
+                            model.toggleExpanded(repo: repo, run: run.id)
+                        }
+                        // Trends for the busiest repo on screen.
+                        if let repo = model.visibleRepos.max(by: { (model.runs[$0]?.count ?? 0) < (model.runs[$1]?.count ?? 0) }) {
+                            model.trends = TrendsTarget(repo: repo)
+                            try? await Task.sleep(for: .seconds(10))
+                            ResizeBench.capture("trends", in: dir)
+                            model.trends = nil
+                            try? await Task.sleep(for: .seconds(0.7))
+                        }
+                        // The Run Workflow form (opened only; nothing is started).
+                        if let repo = model.visibleRepos.first(where: { $0 == "sr3d/diagrammd" }) ?? model.visibleRepos.first {
+                            model.dispatching = DispatchTarget(repo: repo)
+                            try? await Task.sleep(for: .seconds(6))
+                            ResizeBench.capture("run-workflow", in: dir)
+                            model.dispatching = nil
+                            try? await Task.sleep(for: .seconds(0.7))
+                        }
+                        await next(0)
+                    }
+                }
+                ResizeBench.runIfRequested()
+            }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model.refreshVisible()
             }
         }
         .defaultSize(width: 1100, height: 720)
         .commands {
+            CommandGroup(after: .windowList) {
+                Button("Alert List") { openWindow(id: "alerts") }
+                    .keyboardShortcut("l", modifiers: [.command, .option])
+            }
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .toolbar) {
                 Button("Zoom In") { zoom = Zoom.step(zoom, up: true) }
@@ -55,6 +120,8 @@ struct ActionsHubApp: App {
                         .keyboardShortcut(i < 9 ? KeyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: [.command, .option]) : nil)
                 }
                 Divider()
+                Button("Alerts for This Group…") { model.alerts.editing = .group(model.currentGroupID) }
+                Divider()
                 Button("New Group") { model.addGroup(named: "") }
                     .keyboardShortcut("n", modifiers: [.command, .option])
             }
@@ -67,6 +134,20 @@ struct ActionsHubApp: App {
                     if let s = model.selected { Task { await model.refreshRuns(s) } }
                 }
                 .keyboardShortcut("r", modifiers: .command)
+                Button("Alerts for This Repo…") {
+                    if let s = model.selected { model.alerts.editing = .repo(s) }
+                }
+                .disabled(model.selected == nil)
+                Button("Run Workflow…") {
+                    if let s = model.selected { model.dispatching = DispatchTarget(repo: s) }
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(model.selected == nil)
+                Button("Trends…") {
+                    if let s = model.selected { model.trends = TrendsTarget(repo: s) }
+                }
+                .keyboardShortcut("t", modifiers: [.command, .option])
+                .disabled(model.selected == nil)
                 Button("Open Actions in Browser") {
                     if let s = model.selected { model.openInBrowser(model.url(for: s)) }
                 }
@@ -88,6 +169,26 @@ struct ActionsHubApp: App {
                 }
             }
         }
+
+        // Every alert that fired, across all repos.
+        Window("Alerts", id: "alerts") {
+            AlertListView()
+                .zFont(.body)
+                .environment(\.zoom, zoom)
+                .environment(model)
+        }
+        .defaultSize(width: 520, height: 600)
+
+        // Keeps watching (and alerting) with the main window closed.
+        MenuBarExtra {
+            MenuBarPanel()
+                .environment(\.zoom, zoom)
+                .environment(model)
+        } label: {
+            MenuBarIcon()
+                .environment(model)
+        }
+        .menuBarExtraStyle(.window)
 
         // ⌘, — GitHub accounts.
         Settings {
@@ -188,6 +289,7 @@ extension View {
     @Environment(\.zoom) private var z
     @Environment(AppModel.self) private var model
     @AppStorage("prPaneWidth") private var prWidth: Double = 380
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ZStack {
@@ -217,6 +319,30 @@ extension View {
         }
         .zFont(.body)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            model.windowOpen = true
+            model.openMainWindow = { openWindow(id: "main") }
+            model.openAlertList = { openWindow(id: "alerts") }
+        }
+        .onDisappear { model.windowOpen = false }
+        .sheet(item: Binding(get: { model.dispatching }, set: { model.dispatching = $0 })) { target in
+            DispatchSheet(repo: target.repo)
+                .zFont(.body)
+                .environment(\.zoom, z)
+                .environment(model)
+        }
+        .sheet(item: Binding(get: { model.trends }, set: { model.trends = $0 })) { target in
+            TrendsSheet(repo: target.repo)
+                .zFont(.body)
+                .environment(\.zoom, z)
+                .environment(model)
+        }
+        .sheet(item: Binding(get: { model.alerts.editing }, set: { model.alerts.editing = $0 })) { target in
+            AlertEditor(target: target)
+                .zFont(.body)
+                .environment(\.zoom, z)
+                .environment(model)
+        }
     }
 }
 

@@ -39,6 +39,9 @@ makes the app slower or leakier, it isn't done.
     then read the `BENCH` line (median/p90 ms per frame; 60 fps needs under 16.7 ms). Copy each build
     to its own .app to A/B them.
   - Look at the UI without screen recording: `--env ACTIONSHUB_SNAPSHOT=<dir>` writes PNGs at three
-    window sizes.
+    window sizes, then a failed run with its log, the trends and Run Workflow sheets, the alert
+    editors and the alert list (it opens them only; nothing is saved or started).
+  - Alert rules and the workflow-input parser: `--env ACTIONSHUB_ALERT_SELFTEST=1 --stderr <log>`
+    prints PASS/FAIL per case and quits; run it after touching `AlertDetector` or `DispatchParser`.
   - Run the old and new builds side by side (`open -n dist/ActionsHub.app`); they share settings, so
     they show the same group.

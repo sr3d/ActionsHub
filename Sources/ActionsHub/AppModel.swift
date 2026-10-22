@@ -348,6 +348,10 @@ final class AppModel {
     var expandedRuns: Set<Int> = []
     var workflowFilter: [String: String] = [:]
     var actionError: String?
+    /// The trends sheet's repo.
+    var trends: TrendsTarget?
+    /// The Run Workflow sheet's repo.
+    var dispatching: DispatchTarget?
     var showSwitcher = false
     /// When true, the palette adds repos to the current group instead of opening them.
     var switcherAddsToGroup = false
@@ -362,6 +366,60 @@ final class AppModel {
     }
 
     private var pollTask: Task<Void, Never>?
+
+    // MARK: Alerts
+
+    let alerts = AlertStore()
+    /// Runs you cancelled or rejected here: they never alert you.
+    var ownActions: Set<Int> = []
+    /// Whether the main window is open. Closed: only repos with alerts are polled, at the idle rate.
+    var windowOpen = true
+    /// Reopens the main window (set by a view that can reach `openWindow`).
+    @ObservationIgnored var openMainWindow: (() -> Void)?
+    @ObservationIgnored var openAlertList: (() -> Void)?
+    /// Worst state across every group's repos, for the menu bar icon. Stored, updated after
+    /// each fetch, so the icon never recomputes it.
+    private(set) var overallState: RunState?
+
+    /// Each repo's status dot, and each workflow's usual time (by repo, then workflow file).
+    /// Stored: sidebar rows and running rows read them on every render.
+    private(set) var summaries: [String: RunState] = [:]
+    private(set) var usualDurations: [String: [String: TimeInterval]] = [:]
+
+    /// Rebuilds what's derived from one repo's runs; call after `runs[repo]` changes.
+    private func runsChanged(_ repo: String) {
+        let s = computeSummary(repo)
+        if summaries[repo] != s { summaries[repo] = s }
+        let usual = runs[repo].map(Self.usualDurations)
+        if usualDurations[repo] != usual { usualDurations[repo] = usual }
+        // Jobs of runs that left every list (expanded once, or watched) aren't kept.
+        if jobs.count > 100 {
+            let live = Set(runs.values.flatMap { $0.map(\.id) })
+            jobs = jobs.filter { live.contains($0.key) }
+        }
+        updateOverallState()
+    }
+
+    private func updateOverallState() {
+        var worst: RunState?
+        func rank(_ s: RunState?) -> Int {
+            switch s {
+            case .failure: 4
+            case .waiting: 3
+            case .running, .queued: 2
+            case .success: 1
+            default: 0
+            }
+        }
+        var seen = Set<String>()
+        for group in groups {
+            for repo in group.repos where seen.insert(repo).inserted {
+                let s = summaries[repo]
+                if rank(s) > rank(worst) { worst = s }
+            }
+        }
+        if worst != overallState { overallState = worst }
+    }
 
     // MARK: Accounts
 
@@ -415,6 +473,7 @@ final class AppModel {
     func setAccountOverride(_ login: String?, for repo: String) {
         accountOverrides[repo] = login
         runs[repo] = nil
+        runsChanged(repo)
         runsError[repo] = nil
         probed.remove(repo)
         Task {
@@ -430,7 +489,27 @@ final class AppModel {
     func start() {
         guard !started else { return }
         started = true
+        let notifier = AlertNotifier.shared
+        notifier.setUp()
+        notifier.onOpen = { [weak self] repo, run in self?.reveal(repo: repo, run: run) }
+        notifier.onOpenList = { [weak self] in
+            NSApp.activate(ignoringOtherApps: true)
+            self?.openAlertList?()
+        }
+        notifier.onRerun = { [weak self] repo, run in
+            guard let self, let r = self.runs[repo]?.first(where: { $0.id == run }) else { return }
+            self.rerun(repo: repo, run: r, failedOnly: true)
+        }
+        notifier.onApprove = { [weak self] repo, run in
+            guard let self, let r = self.runs[repo]?.first(where: { $0.id == run }) else { return }
+            Task {
+                await self.loadPending(repo: repo, run: r)
+                if self.canReview(r, repo: repo) { self.review(repo: repo, run: r, approve: true) } else { self.reveal(repo: repo, run: run) }
+            }
+        }
+        if alerts.hasAnyRule { notifier.requestAuthorization() }
         Task {
+            await alerts.loadLog()
             await accounts.discover()
             await accountsChanged()
         }
@@ -487,19 +566,39 @@ final class AppModel {
 
     /// Repos on screen: every 15s while something is running, otherwise every 60s.
     /// Other pinned repos: every 2 minutes, for their sidebar status dots.
+    /// With the window closed nothing is drawn: only repos with alerts are polled, and at
+    /// the idle rate (every 60s, or 2 minutes when nothing runs).
     private func poll(tick: Int) async {
-        let visible = visibleRepos
-        for repo in visible {
-            let active = runs[repo]?.contains { $0.state.isMoving } ?? false
-            if active || tick % 4 == 0 { await refreshRuns(repo) }
-            for id in expandedRuns where runs[repo]?.first(where: { $0.id == id })?.state.isMoving == true {
-                await loadJobs(repo: repo, run: id)
+        var covered = Set<String>()
+        if windowOpen {
+            let visible = visibleRepos
+            for repo in visible {
+                let active = runs[repo]?.contains { $0.state.isMoving } ?? false
+                if active || tick % 4 == 0 { await refreshRuns(repo); covered.insert(repo) }
+                for id in expandedRuns where runs[repo]?.first(where: { $0.id == id })?.state.isMoving == true {
+                    await loadJobs(repo: repo, run: id)
+                }
+            }
+            if tick % 8 == 0 {
+                for name in pinned where !visible.contains(name) { await refreshRuns(name); covered.insert(name) }
+                await refreshPRs()
             }
         }
-        if tick % 8 == 0 {
-            for name in pinned where !visible.contains(name) { await refreshRuns(name) }
-            await refreshPRs()
+        // Repos with alerts, wherever they are (another group, or the window closed).
+        let fast = windowOpen ? 2 : 4
+        for repo in alertRepos.sorted() where !covered.contains(repo) {
+            // Moving, not waiting: a run parked on an approval for days needs no fast polling.
+            let active = runs[repo]?.contains { $0.state.isMoving } ?? false
+            if (active && tick % fast == 0) || tick % 8 == 0 { await refreshRuns(repo) }
         }
+        // Step alerts need the watched runs' jobs: one request per poll for each.
+        if windowOpen || tick % 4 == 0 {
+            for (repo, run) in stepWatchedRuns() where !expandedRuns.contains(run) || !windowOpen {
+                await loadJobs(repo: repo, run: run)
+            }
+        }
+        // Everything this tick found, as one round of notifications.
+        AlertNotifier.shared.flush()
     }
 
     /// Called when the app becomes frontmost: bring everything visible up to date.
@@ -587,7 +686,12 @@ final class AppModel {
             guard let account = account(for: fullName) else { return }
             do {
                 let fetched = try await account.client.runs(fullName)
-                if runs[fullName] != fetched { runs[fullName] = fetched }
+                let old = runs[fullName]
+                let lastLook = detectRunAlerts(repo: fullName, old: old, new: fetched)
+                if old != fetched { runs[fullName] = fetched; runsChanged(fullName) }
+                for run in lastLook { await loadJobs(repo: fullName, run: run) }
+                finishRunAlerts(repo: fullName, hadRuns: old != nil, new: fetched)
+                for run in fetched where run.state != .waiting && pending[run.id] != nil { pending[run.id] = nil }
                 runsError[fullName] = nil
                 lastUpdated[fullName] = Date()
                 await accounts.noteRateLimit(account.login)
@@ -630,10 +734,51 @@ final class AppModel {
         guard let account = account(for: repo) else { return }
         do {
             let fetched = try await account.client.jobs(repo, run: run)
+            detectStepAlerts(repo: repo, runID: run, old: jobs[run], new: fetched)
             if jobs[run] != fetched { jobs[run] = fetched }
         } catch {
             actionError = error.localizedDescription
         }
+        await accounts.noteRateLimit(account.login)
+    }
+
+    // MARK: Logs
+
+    struct JobLog: Hashable {
+        /// nil when there's no log to show; `note` says why.
+        var excerpt: LogExcerpt?
+        var note: String?
+        var annotations: [CheckAnnotation]
+    }
+
+    /// Trimmed logs of failed jobs, by job id. At most `maxLogs`; the oldest goes first.
+    private(set) var jobLogs: [Int: JobLog] = [:]
+    private var jobLogOrder: [Int] = []
+    private var jobLogLoading: Set<Int> = []
+    static let maxLogs = 20
+
+    /// Fetches a finished job's log and annotations once; they don't change after it ends.
+    /// A job that never started (no steps) has no log, only annotations saying why.
+    func loadLog(repo: String, job: Job) async {
+        guard jobLogs[job.id] == nil, !jobLogLoading.contains(job.id), !job.state.isActive,
+              let account = account(for: repo) else { return }
+        jobLogLoading.insert(job.id)
+        defer { jobLogLoading.remove(job.id) }
+        let client = account.client
+        let started = !(job.steps ?? []).isEmpty
+        async let notes = client.annotations(repo, job: job.id)
+        var log = JobLog(excerpt: nil, note: nil, annotations: [])
+        if started {
+            do { log.excerpt = try await client.jobLog(repo, job: job.id) }
+            catch { log.note = (error as? GitHubError)?.status == 404 ? "GitHub has no log for this job." : "Couldn't load the log: \(error.localizedDescription)" }
+        } else {
+            log.note = "This job never started, so it has no log."
+        }
+        log.annotations = (try? await notes) ?? []
+        jobLogs[job.id] = log
+        jobLogOrder.removeAll { $0 == job.id }
+        jobLogOrder.append(job.id)
+        while jobLogOrder.count > Self.maxLogs { jobLogs[jobLogOrder.removeFirst()] = nil }
         await accounts.noteRateLimit(account.login)
     }
 
@@ -653,12 +798,59 @@ final class AppModel {
     }
 
     func cancel(repo: String, run: WorkflowRun) {
+        ownActions.insert(run.id)
         perform(repo) { try await $0.cancel(repo, run: run.id) }
     }
 
-    private func perform(_ repo: String, _ action: @escaping (GitHubClient) async throws -> Void) {
+    // MARK: Approvals
+
+    /// Environments each waiting run is parked on, by run id. Loaded when a waiting run is shown.
+    var pending: [Int: [PendingDeployment]] = [:]
+    /// Runs with an approve / reject on its way, so their buttons disable.
+    var reviewing: Set<Int> = []
+
+    /// Whether you can approve this waiting run: a reviewer for at least one of its
+    /// environments, or (for a fork's run) anyone with write access, which GitHub checks.
+    func canReview(_ run: WorkflowRun, repo: String) -> Bool {
+        if run.needsForkApproval { return self.repo(named: repo)?.permissions?.push ?? true }
+        return (pending[run.id] ?? []).contains(where: \.currentUserCanApprove)
+    }
+
+    func loadPending(repo: String, run: WorkflowRun) async {
+        guard run.state == .waiting, !run.needsForkApproval, let account = account(for: repo) else { return }
+        do {
+            let list = try await account.client.pendingDeployments(repo, run: run.id)
+            if pending[run.id] != list { pending[run.id] = list }
+        } catch {
+            pending[run.id] = []
+        }
+        await accounts.noteRateLimit(account.login)
+    }
+
+    /// Approves or rejects every environment on this run that you're a reviewer for.
+    /// Runs from outside contributors' forks are approved as a whole instead.
+    func review(repo: String, run: WorkflowRun, approve: Bool) {
+        guard !reviewing.contains(run.id) else { return }
+        let environments = (pending[run.id] ?? []).filter(\.currentUserCanApprove).map(\.environment.id)
+        guard run.needsForkApproval ? approve : !environments.isEmpty else { return }
+        reviewing.insert(run.id)
+        if !approve { ownActions.insert(run.id) }
+        perform(repo, done: { [weak self] in
+            self?.reviewing.remove(run.id)
+            self?.pending[run.id] = nil
+        }) { client in
+            if run.needsForkApproval {
+                try await client.approveRun(repo, run: run.id)
+            } else {
+                try await client.reviewDeployments(repo, run: run.id, environments: environments, approve: approve)
+            }
+        }
+    }
+
+    private func perform(_ repo: String, done: (() -> Void)? = nil, _ action: @escaping (GitHubClient) async throws -> Void) {
         guard let account = account(for: repo) else { return }
         Task {
+            defer { done?() }
             do {
                 try await action(account.client)
                 try? await Task.sleep(for: .seconds(2))
@@ -801,7 +993,9 @@ final class AppModel {
 
     /// Status dot: the most urgent thing going on — failed, awaiting approval, running —
     /// otherwise green if the latest run passed.
-    func summary(for name: String) -> RunState? {
+    func summary(for name: String) -> RunState? { summaries[name] }
+
+    private func computeSummary(_ name: String) -> RunState? {
         guard let list = runs[name], let latest = list.first else { return nil }
         if attentionCount(.failed, in: name) > 0 { return .failure }
         if attentionCount(.approval, in: name) > 0 { return .waiting }

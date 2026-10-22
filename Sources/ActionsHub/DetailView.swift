@@ -86,7 +86,7 @@ struct RunRowLayout: Layout {
 }
 
 /// One line of run details that drops whole details when it runs out of room, instead of
-/// squashing them: tier 2 goes first, then tier 1; if even tier 0 doesn't fit, the
+/// squashing them: the highest tier goes first, then the next; if even tier 0 doesn't fit, the
 /// `Squeezable` item (the branch) is truncated. Natural widths are measured once and cached,
 /// so a resize only adds up numbers. ViewThatFits with one variant per tier re-measured
 /// every variant of every row on each frame, about 30 ms per frame with a 4x3 grid.
@@ -116,7 +116,7 @@ struct MetaLine: Layout {
     /// Which items to show, and whether the squeezable one must shrink to fit `width`.
     private func plan(_ width: CGFloat?, _ subviews: Subviews, _ cache: Cache) -> (shown: [Bool], squeeze: Bool) {
         let tiers = cache.tiers
-        for maxTier in [2, 1, 0] {
+        for maxTier in stride(from: tiers.max() ?? 0, through: 0, by: -1) {
             let shown = tiers.map { $0 <= maxTier }
             guard let width else { return (shown, false) }
             if naturalWidth(shown, cache) <= width { return (shown, false) }
@@ -508,6 +508,18 @@ struct GridLines: Shape {
                     }
                 }
                 .layoutValue(key: MetaLine.Tier.self, value: 1)
+                let alertRule = model.repoAlertRule(repo)
+                HeaderButton(symbol: alertRule == nil ? "bell" : "bell.fill",
+                             help: alertRule.map { "Alerts when a run \($0.summary)" } ?? "Alerts are off for this repo") {
+                    model.alerts.editing = .repo(repo)
+                }
+                .foregroundStyle(alertRule == nil ? Color.primary : Color.orange)
+                // Newer buttons go first, before filter and pin (they have menu items too).
+                .layoutValue(key: MetaLine.Tier.self, value: 3)
+                HeaderButton(symbol: "chart.bar.xaxis", help: "Trends: pass rate, run times, flaky jobs (⌥⌘T)") {
+                    model.trends = TrendsTarget(repo: repo)
+                }
+                .layoutValue(key: MetaLine.Tier.self, value: 3)
                 PRLinkButton(repo: repo)
                     .layoutValue(key: MetaLine.Tier.self, value: 1)
                 HeaderButton(symbol: "safari", help: "Open in browser (⇧⌘O)") { model.openInBrowser(model.url(for: repo)) }
@@ -691,8 +703,19 @@ struct GridLines: Shape {
     let repo: String
     let run: WorkflowRun
     @State private var hovering = false
+    @State private var rejecting = false
 
     private var expanded: Bool { model.expandedRuns.contains(run.id) }
+
+    /// Time left for a running run, against the median of its workflow's recent green runs.
+    private var eta: (text: String, help: String, fraction: Double, late: Bool)? {
+        guard run.state == .running, let elapsed = run.duration,
+              let usual = model.usualDuration(repo: repo, workflowFile: run.workflowFile), usual > 0 else { return nil }
+        let left = usual - elapsed
+        let help = "Usually takes \(Format.duration(usual)) (median of recent successful runs)"
+        if left <= 0 { return ("· over by \(Format.duration(-left))", help, 1, true) }
+        return ("· ~\(Format.duration(left)) left", help, min(elapsed / usual, 0.99), false)
+    }
 
     /// Workflow, run number, branch and extras on one line. Narrow panes drop details instead
     /// of squashing them (see `MetaLine`).
@@ -740,42 +763,84 @@ struct GridLines: Shape {
                 }
                 .layoutValue(key: RunRowLayout.Flexible.self, value: true)
                 VStack(alignment: .trailing, spacing: 3 * z) {
-                    Text(Format.ago(run.createdAt)).zFont(.caption)
+                    HStack(spacing: 4 * z) {
+                        if let watch = model.alerts.runWatches[run.id] {
+                            Image(systemName: "bell.fill").foregroundStyle(.orange)
+                                .help("Alert on this run: \(watch.rule.summary)")
+                        }
+                        Text(Format.ago(run.createdAt))
+                    }
+                    .zFont(.caption)
                     if run.state == .waiting {
                         Text("awaiting review").zFont(.caption).foregroundStyle(.purple)
                     } else if run.state == .queued {
                         Text("queued").zFont(.caption).foregroundStyle(.secondary)
                     } else if let d = run.duration {
-                        Label(Format.duration(d), systemImage: "stopwatch")
-                            .zFont(.caption).monospacedDigit()
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 4 * z) {
+                            Label(Format.duration(d), systemImage: "stopwatch")
+                                .foregroundStyle(.secondary)
+                            if let eta {
+                                Text(eta.text).foregroundStyle(eta.late ? .orange : .secondary)
+                                    .help(eta.help)
+                            }
+                        }
+                        .zFont(.caption).monospacedDigit()
                     }
                 }
             }
             .padding(.horizontal, 16 * z)
             .padding(.vertical, 9 * z)
             .background(hovering ? Color.primary.opacity(0.04) : .clear)
+            .overlay(alignment: .bottom) {
+                // How far along it is against the usual time. An overlay: no layout cost.
+                if let eta {
+                    ProgressLine(fraction: eta.fraction)
+                        .fill(eta.late ? Color.orange : run.state.color.opacity(0.8))
+                        .frame(height: 2 * z)
+                }
+            }
             .contentShape(Rectangle())
             .onTapGesture { model.toggleExpanded(repo: repo, run: run.id) }
             .onHover { hovering = $0 }
             .contextMenu { menu }
 
+            if run.state == .waiting {
+                ApprovalBar(repo: repo, run: run, rejecting: $rejecting)
+                    .padding(.leading, 52 * z)
+                    .padding(.trailing, 16 * z)
+                    .padding(.bottom, 9 * z)
+            }
+
             if expanded {
-                JobsList(jobs: model.jobs[run.id])
+                JobsList(repo: repo, run: run, jobs: model.jobs[run.id])
                     .padding(.leading, 52 * z)
                     .padding(.trailing, 16 * z)
                     .padding(.bottom, 10 * z)
             }
         }
+        .confirmationDialog("Reject the deployment of “\(run.title)”?", isPresented: $rejecting) {
+            Button("Reject", role: .destructive) { model.review(repo: repo, run: run, approve: false) }
+        } message: {
+            Text("The run stops at this point and is marked as failed.")
+        }
     }
 
     @ViewBuilder private var menu: some View {
         Button("Open in Browser") { model.openInBrowser(run.htmlUrl) }
+        Button(model.alerts.runWatches[run.id] == nil ? "Alert Me About This Run…" : "Change Alert on This Run…") {
+            model.alerts.editing = .run(repo: repo, run: run)
+        }
         Button("Copy Link") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(run.htmlUrl.absoluteString, forType: .string)
         }
         Divider()
+        if run.state == .waiting, model.canReview(run, repo: repo) {
+            Button(run.needsForkApproval ? "Approve and Run" : "Approve Deployment") { model.review(repo: repo, run: run, approve: true) }
+            if !run.needsForkApproval {
+                Button("Reject Deployment…") { rejecting = true }
+            }
+        }
         if run.state.isActive {
             Button("Cancel Run") { model.cancel(repo: repo, run: run) }
         } else {
@@ -787,9 +852,59 @@ struct GridLines: Shape {
     }
 }
 
+/// Under a run that's waiting: what it waits on, and Approve / Reject when you're a reviewer.
+/// Environments are looked up once the row shows (and again when the run changes), so
+/// only runs you can see cost a request.
+@MainActor private struct ApprovalBar: View {
+    @Environment(\.zoom) private var z
+    @Environment(AppModel.self) private var model
+    let repo: String
+    let run: WorkflowRun
+    @Binding var rejecting: Bool
+
+    private var environments: String {
+        (model.pending[run.id] ?? []).compactMap(\.environment.name).joined(separator: ", ")
+    }
+
+    var body: some View {
+        HStack(spacing: 8 * z) {
+            if run.needsForkApproval {
+                Text("A run from an outside contributor needs approval").foregroundStyle(.secondary)
+            } else if let list = model.pending[run.id] {
+                if list.isEmpty {
+                    Text("Waiting").foregroundStyle(.secondary)
+                } else {
+                    Text("Waiting for \(environments)").foregroundStyle(.secondary).lineLimit(1)
+                    if !model.canReview(run, repo: repo) {
+                        Text("· you're not a reviewer").foregroundStyle(.tertiary).lineLimit(1)
+                    }
+                }
+            } else {
+                ProgressView().controlSize(.mini)
+            }
+            Spacer(minLength: 4 * z)
+            if model.canReview(run, repo: repo) {
+                if !run.needsForkApproval {
+                    Button("Reject…") { rejecting = true }
+                        .controlSize(.small)
+                }
+                Button(run.needsForkApproval ? "Approve and Run" : "Approve") { model.review(repo: repo, run: run, approve: true) }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+            }
+        }
+        .zFont(.caption)
+        .disabled(model.reviewing.contains(run.id))
+        .task(id: run.updatedAt) { await model.loadPending(repo: repo, run: run) }
+    }
+}
+
 @MainActor private struct JobsList: View {
     @Environment(\.zoom) private var z
     @Environment(AppModel.self) private var model
+    let repo: String
+    let run: WorkflowRun
     let jobs: [Job]?
 
     var body: some View {
@@ -811,6 +926,15 @@ struct GridLines: Shape {
                                 .buttonStyle(.borderless)
                                 .help("Open job log in browser")
                             }
+                            if !(job.steps ?? []).isEmpty {
+                                let watched = model.alerts.stepWatches.contains { $0.repo == repo && $0.jobName == job.name && ($0.runID == nil || $0.runID == run.id) }
+                                Button { model.alerts.editing = .step(repo: repo, run: run, job: job) } label: {
+                                    Image(systemName: watched ? "bell.fill" : "bell")
+                                        .foregroundStyle(watched ? Color.orange : Color.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                                .help(watched ? "Step alerts on this job" : "Alert on a step of this job…")
+                            }
                         }
                         // Surface the step that broke so you don't have to open the log.
                         ForEach(interestingSteps(job), id: \.number) { step in
@@ -821,8 +945,21 @@ struct GridLines: Shape {
                             .padding(.leading, 24 * z)
                             .foregroundStyle(.secondary)
                         }
+                        if job.state == .failure {
+                            JobLogView(repo: repo, job: job)
+                                .padding(.leading, 24 * z)
+                                .padding(.top, 4 * z)
+                        }
                     }
                     .padding(.vertical, 3 * z)
+                    .contentShape(Rectangle())
+                    .contextMenu {
+                        Button("Alert on a Step…") { model.alerts.editing = .step(repo: repo, run: run, job: job) }
+                            .disabled(job.steps?.isEmpty ?? true)
+                        if let url = job.htmlUrl {
+                            Button("Open Job in Browser") { model.openInBrowser(url) }
+                        }
+                    }
                 }
                 if jobs.isEmpty {
                     Text("No jobs").zFont(.caption).foregroundStyle(.secondary)
@@ -837,6 +974,110 @@ struct GridLines: Shape {
 
     private func interestingSteps(_ job: Job) -> [Step] {
         (job.steps ?? []).filter { $0.state == .failure || $0.state == .running }
+    }
+}
+
+/// The leading `fraction` of its rect, for progress lines.
+struct ProgressLine: Shape {
+    var fraction: Double
+    func path(in rect: CGRect) -> Path {
+        Path(CGRect(x: rect.minX, y: rect.minY, width: rect.width * max(0, min(1, fraction)), height: rect.height))
+    }
+}
+
+/// A failed job's error annotations and the end of its log, fetched when it's first shown.
+@MainActor private struct JobLogView: View {
+    @Environment(\.zoom) private var z
+    @Environment(AppModel.self) private var model
+    let repo: String
+    let job: Job
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6 * z) {
+            if let log = model.jobLogs[job.id] {
+                ForEach(Array(log.annotations.filter { $0.annotationLevel != "notice" }.prefix(8).enumerated()), id: \.offset) { _, note in
+                    HStack(alignment: .firstTextBaseline, spacing: 6 * z) {
+                        Image(systemName: note.isFailure ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(note.isFailure ? .red : .orange)
+                        VStack(alignment: .leading, spacing: 1 * z) {
+                            if let location = note.location {
+                                Text(location).zFont(.caption, design: .monospaced).textSelection(.enabled)
+                            }
+                            Text(note.message).zFont(.caption).lineLimit(3).textSelection(.enabled)
+                        }
+                    }
+                }
+                if let excerpt = log.excerpt {
+                    HStack {
+                        Text(excerpt.errorLine == nil ? "End of the log" : "Log around the first error")
+                            .zFont(.caption, weight: .semibold).foregroundStyle(.secondary)
+                        Text("\(excerpt.lines.count) of \(excerpt.totalLines) lines").zFont(.caption).foregroundStyle(.tertiary)
+                        Spacer()
+                        if let url = job.htmlUrl {
+                            Button("Full log") { model.openInBrowser(url) }.buttonStyle(.link).zFont(.caption)
+                        }
+                    }
+                    LogTextView(excerpt: excerpt, fontSize: 11 * z)
+                        .frame(height: 220 * z)
+                        .clipShape(RoundedRectangle(cornerRadius: 6 * z))
+                } else if let note = log.note {
+                    Text(note).zFont(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                HStack(spacing: 6 * z) {
+                    ProgressView().controlSize(.mini)
+                    Text("Loading log…").zFont(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .task(id: job.id) { await model.loadLog(repo: repo, job: job) }
+    }
+}
+
+/// Read-only monospaced text, scrolled to the first error. AppKit's text view lays out a few
+/// hundred lines once; a SwiftUI Text per line would be laid out again on every resize.
+struct LogTextView: NSViewRepresentable {
+    let excerpt: LogExcerpt
+    let fontSize: CGFloat
+
+    final class Coordinator { var shown: LogExcerpt?; var size: CGFloat = 0 }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = true
+        scroll.backgroundColor = .textBackgroundColor
+        if let text = scroll.documentView as? NSTextView {
+            text.isEditable = false
+            text.isSelectable = true
+            text.isRichText = false
+            text.textContainerInset = NSSize(width: 6 * fontSize / 11, height: 6 * fontSize / 11)
+            text.drawsBackground = false
+        }
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let text = scroll.documentView as? NSTextView,
+              context.coordinator.shown != excerpt || context.coordinator.size != fontSize else { return }
+        context.coordinator.shown = excerpt
+        context.coordinator.size = fontSize
+        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        let out = NSMutableAttributedString()
+        var errorStart: Int?
+        for (i, line) in excerpt.lines.enumerated() {
+            let isError = line.hasPrefix("error: ")
+            let color: NSColor = isError ? .systemRed : line.hasPrefix("warning: ") ? .systemOrange : .textColor
+            if i == excerpt.errorLine { errorStart = out.length }
+            out.append(NSAttributedString(string: line + "\n", attributes: [.font: font, .foregroundColor: color]))
+        }
+        text.textStorage?.setAttributedString(out)
+        if let errorStart {
+            text.scrollRangeToVisible(NSRange(location: errorStart, length: 0))
+        } else {
+            text.scrollToEndOfDocument(nil)
+        }
     }
 }
 

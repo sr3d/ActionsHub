@@ -21,6 +21,7 @@ import AppKit
                 }
                 .buttonStyle(.plain)
                 .help("Pull requests (⇧⌘P)")
+                AlertListButton()
             }
             .padding(.horizontal, 10 * z)
             .padding(.top, 10 * z)
@@ -69,6 +70,29 @@ import AppKit
             .padding(.vertical, 7 * z)
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+    }
+}
+
+/// Opens the alert list; filled when the current group has alerts on.
+@MainActor private struct AlertListButton: View {
+    @Environment(\.zoom) private var z
+    @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        let on = model.alerts.groupRules[model.currentGroupID] != nil
+        Button { openWindow(id: "alerts") } label: {
+            Image(systemName: on ? "bell.fill" : "bell")
+                .foregroundStyle(on ? Color.orange : Color.primary)
+                .frame(width: 30 * z, height: 30 * z)
+                .background(RoundedRectangle(cornerRadius: 7 * z).fill(Color.primary.opacity(0.06)))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(on ? "Alert list (⌥⌘L). Alerts are on for this group." : "Alert list (⌥⌘L)")
+        .contextMenu {
+            Button("Alerts for This Group…") { model.alerts.editing = .group(model.currentGroupID) }
+        }
     }
 }
 
@@ -136,6 +160,7 @@ import AppKit
                     }
                     .contextMenu {
                         Button("Rename…") { draft = group.name; editing = group.id; fieldFocused = true }
+                        Button("Alerts…") { close(); model.alerts.editing = .group(group.id) }
                         Button("Delete Group", role: .destructive) { model.deleteGroup(group.id) }
                             .disabled(model.groups.count < 2)
                     }
@@ -319,6 +344,9 @@ import AppKit
             if model.multiAccount || model.accountOverrides[fullName] != nil {
                 AccountMenu(repo: fullName)
             }
+            Button("Alerts…") { model.alerts.editing = .repo(fullName) }
+            Button("Trends…") { model.trends = TrendsTarget(repo: fullName) }
+            Button("Run Workflow…") { model.dispatching = DispatchTarget(repo: fullName) }
             Menu("Color") {
                 ForEach(RepoColor.allCases, id: \.self) { c in
                     Toggle(c.name, isOn: Binding(get: { model.color(for: fullName) == c },
