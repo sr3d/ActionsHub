@@ -25,7 +25,7 @@ struct Account: Identifiable {
     let login: String
     var source: AccountSource
     var status: AccountStatus = .checking
-    var rateLimit: Int?
+    var rateLimit: RateLimit?
     var ghActive = false
     let client: GitHubClient
 
@@ -145,8 +145,9 @@ final class AccountStore {
 
     func noteRateLimit(_ login: String) async {
         guard let account = account(login) else { return }
-        let remaining = await account.client.rateLimitRemaining
-        update(account.id) { $0.rateLimit = remaining }
+        let limit = await account.client.rateLimit
+        guard account.rateLimit != limit else { return }
+        update(account.id) { $0.rateLimit = limit }
     }
 
     func markInvalid(_ login: String, _ message: String) {

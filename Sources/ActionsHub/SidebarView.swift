@@ -373,27 +373,43 @@ import AppKit
     var body: some View {
         let accounts = model.accounts.accounts
         if accounts.count <= 1 {
-            if let remaining = accounts.first?.rateLimit {
-                Text("API \(remaining)").zFont(.caption2).foregroundStyle(.secondary)
-                    .help("GitHub API requests left this hour")
+            if let limit = accounts.first?.rateLimit {
+                // One footer, not a repeated row, so ViewThatFits is fine here.
+                ViewThatFits(in: .horizontal) {
+                    Text("API \(limit.label)\(limit.percent.map { " · \($0)%" } ?? "")").fixedSize()
+                    Text("API \(limit.label)").fixedSize()
+                    Text("API \(limit.remaining)").fixedSize()
+                }
+                .zFont(.caption2).foregroundStyle(.secondary)
+                .help(limit.detail)
             }
             warning(for: accounts)
         } else {
+            // Lowest budget first: it's the one that runs out.
+            let lowest = accounts.compactMap(\.rateLimit).min { $0.remaining < $1.remaining }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8 * z) {
                     ForEach(accounts) { a in
-                        Text("\(a.login) \(a.rateLimit.map(String.init) ?? "–")").fixedSize()
+                        Text("\(a.login) \(a.rateLimit.map { $0.label + ($0.percent.map { " · \($0)%" } ?? "") } ?? "–")").fixedSize()
                     }
                     warning(for: accounts)
                 }
                 HStack(spacing: 4 * z) {
-                    Text("API \(accounts.compactMap(\.rateLimit).min().map(String.init) ?? "–")").fixedSize()
+                    Text("API \(lowest.map { $0.label + ($0.percent.map { " · \($0)%" } ?? "") } ?? "–")").fixedSize()
+                    warning(for: accounts)
+                }
+                HStack(spacing: 4 * z) {
+                    Text("API \(lowest.map(\.label) ?? "–")").fixedSize()
+                    warning(for: accounts)
+                }
+                HStack(spacing: 4 * z) {
+                    Text("API \(lowest.map { "\($0.remaining)" } ?? "–")").fixedSize()
                     warning(for: accounts)
                 }
             }
             .zFont(.caption2)
             .foregroundStyle(.secondary)
-            .help(accounts.map { "\($0.login): \($0.rateLimit.map(String.init) ?? "?") API requests left" }.joined(separator: "\n"))
+            .help(accounts.map { "\($0.login): \($0.rateLimit?.detail ?? "no requests yet")" }.joined(separator: "\n"))
         }
     }
 

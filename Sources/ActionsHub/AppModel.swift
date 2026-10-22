@@ -572,25 +572,28 @@ final class AppModel {
         var covered = Set<String>()
         if windowOpen {
             let visible = visibleRepos
+            let due = visible.filter { repo in tick % 4 == 0 || runs[repo]?.contains { $0.state.isMoving } == true }
+            await refreshEach(due)
+            covered.formUnion(due)
             for repo in visible {
-                let active = runs[repo]?.contains { $0.state.isMoving } ?? false
-                if active || tick % 4 == 0 { await refreshRuns(repo); covered.insert(repo) }
                 for id in expandedRuns where runs[repo]?.first(where: { $0.id == id })?.state.isMoving == true {
                     await loadJobs(repo: repo, run: id)
                 }
             }
             if tick % 8 == 0 {
-                for name in pinned where !visible.contains(name) { await refreshRuns(name); covered.insert(name) }
+                let others = pinned.filter { !visible.contains($0) }
+                await refreshEach(others)
+                covered.formUnion(others)
                 await refreshPRs()
             }
         }
         // Repos with alerts, wherever they are (another group, or the window closed).
         let fast = windowOpen ? 2 : 4
-        for repo in alertRepos.sorted() where !covered.contains(repo) {
+        await refreshEach(alertRepos.sorted().filter { repo in
             // Moving, not waiting: a run parked on an approval for days needs no fast polling.
             let active = runs[repo]?.contains { $0.state.isMoving } ?? false
-            if (active && tick % fast == 0) || tick % 8 == 0 { await refreshRuns(repo) }
-        }
+            return !covered.contains(repo) && ((active && tick % fast == 0) || tick % 8 == 0)
+        })
         // Step alerts need the watched runs' jobs: one request per poll for each.
         if windowOpen || tick % 4 == 0 {
             for (repo, run) in stepWatchedRuns() where !expandedRuns.contains(run) || !windowOpen {
@@ -601,13 +604,21 @@ final class AppModel {
         AlertNotifier.shared.flush()
     }
 
+    /// Refreshes repos a few at a time: their requests overlap, so a tick with many repos
+    /// doesn't stretch past the poll interval. Same number of requests as one by one.
+    private func refreshEach(_ repos: [String]) async {
+        for start in stride(from: 0, to: repos.count, by: 4) {
+            let tasks = repos[start..<min(start + 4, repos.count)].map { repo in Task { await refreshRuns(repo) } }
+            for task in tasks { await task.value }
+        }
+    }
+
     /// Called when the app becomes frontmost: bring everything visible up to date.
     func refreshVisible() {
         guard auth == .ready else { return }
         Task {
             let visible = visibleRepos
-            for name in visible { await refreshRuns(name) }
-            for name in pinned where !visible.contains(name) { await refreshRuns(name) }
+            await refreshEach(visible + pinned.filter { !visible.contains($0) })
             await refreshPRs()
         }
     }

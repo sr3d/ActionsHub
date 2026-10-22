@@ -659,7 +659,8 @@ struct GridLines: Shape {
     }
 }
 
-@MainActor private struct HeaderButton: View {
+/// Small borderless icon button: pane headers and PR rows' hover actions.
+@MainActor struct HeaderButton: View {
     @Environment(\.zoom) private var z
     let symbol: String
     let help: String
@@ -671,6 +672,7 @@ struct GridLines: Shape {
         }
         .buttonStyle(.borderless)
         .help(help)
+        .accessibilityLabel(help)
     }
 }
 
@@ -1011,7 +1013,7 @@ struct ProgressLine: Shape {
                     HStack {
                         Text(excerpt.errorLine == nil ? "End of the log" : "Log around the first error")
                             .zFont(.caption, weight: .semibold).foregroundStyle(.secondary)
-                        Text("\(excerpt.lines.count) of \(excerpt.totalLines) lines").zFont(.caption).foregroundStyle(.tertiary)
+                        Text("\(excerpt.lines.count) of \(excerpt.truncated ? "the last 16 MB, " : "")\(excerpt.totalLines) lines").zFont(.caption).foregroundStyle(.tertiary)
                         Spacer()
                         if let url = job.htmlUrl {
                             Button("Full log") { model.openInBrowser(url) }.buttonStyle(.link).zFont(.caption)

@@ -193,25 +193,56 @@ import AppKit
         .padding(.horizontal, 12 * z)
         .padding(.vertical, 8 * z)
         .background(hovering ? Color.primary.opacity(0.05) : .clear)
+        // Hover actions float over the trailing edge, so showing them never re-lays out the row.
+        .overlay(alignment: .trailing) {
+            if hovering { hoverActions }
+        }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture { model.openInBrowser(pr.url) }
         .help("Open #\(pr.number) on GitHub")
-        .contextMenu {
-            Button("Open in Browser") { model.openInBrowser(pr.url) }
-            Button("Open Files Changed") { model.openInBrowser(pr.url.appendingPathComponent("files")) }
-            Button("Copy Link") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(pr.url.absoluteString, forType: .string)
-            }
+        .contextMenu { menuItems }
+    }
+
+    /// Shortcuts for the context menu's most used items, plus a ⋯ menu with all of them.
+    private var hoverActions: some View {
+        HStack(spacing: 0) {
+            HeaderButton(symbol: "safari", help: "Open in browser") { model.openInBrowser(pr.url) }
+            HeaderButton(symbol: "plus.forwardslash.minus", help: "Open files changed") { model.openInBrowser(pr.url.appendingPathComponent("files")) }
+            HeaderButton(symbol: "link", help: "Copy link") { copyLink() }
             if model.panes.contains(pr.repo) {
-                Divider()
-                Button("Show \(pr.repoName) Actions") { model.activate(pr.repo) }
+                HeaderButton(symbol: "play.circle", help: "Show \(pr.repoName) Actions") { model.activate(pr.repo) }
             }
+            Menu { menuItems } label: {
+                Image(systemName: "ellipsis").frame(width: 22 * z, height: 22 * z)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More actions")
+            .accessibilityLabel("More actions")
+        }
+        .padding(.horizontal, 3 * z)
+        .background(RoundedRectangle(cornerRadius: 6 * z).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 6 * z).strokeBorder(Color.primary.opacity(0.1)))
+        .padding(.trailing, 8 * z)
+    }
+
+    @ViewBuilder private var menuItems: some View {
+        Button("Open in Browser") { model.openInBrowser(pr.url) }
+        Button("Open Files Changed") { model.openInBrowser(pr.url.appendingPathComponent("files")) }
+        Button("Copy Link") { copyLink() }
+        if model.panes.contains(pr.repo) {
+            Divider()
+            Button("Show \(pr.repoName) Actions") { model.activate(pr.repo) }
         }
     }
-}
 
+    private func copyLink() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(pr.url.absoluteString, forType: .string)
+    }
+}
 /// Repo name, tinted with the repo's color when one is set.
 @MainActor struct RepoTag: View {
     @Environment(\.zoom) private var z

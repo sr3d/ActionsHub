@@ -90,6 +90,16 @@ enum AlertSelfTest {
         """, "env choice(staging,production) req default=staging; dry_run boolean default=true; tag string default=")
         parse("inline options", "on:\n  workflow_dispatch:\n    inputs:\n      level:\n        type: choice\n        options: [low, high]\n", "level choice(low,high) default=low")
         parse("duplicate name", "on:\n  workflow_dispatch:\n    inputs:\n      a:\n        default: x\n      a:\n        default: y\n", "a string default=x")
+        // A log over LogExcerpt.maxBytes is read from its end only.
+        let big = FileManager.default.temporaryDirectory.appendingPathComponent("actionshub-selftest.log")
+        let filler = String(repeating: "2024-05-01T10:00:00.1234567Z some build output line\n", count: LogExcerpt.maxBytes / 50 + 1000)
+        try? (filler + "2024-05-01T10:00:00.1234567Z ##[error]boom\nafter\n").write(to: big, atomically: true, encoding: .utf8)
+        let excerpt = try? LogExcerpt.make(file: big)
+        try? FileManager.default.removeItem(at: big)
+        let bigOK = excerpt?.truncated == true && excerpt?.errorLine.map { excerpt?.lines[$0] } == "error: boom"
+        if !bigOK { failures += 1 }
+        FileHandle.standardError.write("\(bigOK ? "PASS" : "FAIL") big log read from its end\n".data(using: .utf8)!)
+
         for path in (ProcessInfo.processInfo.environment["ACTIONSHUB_DISPATCH_FILES"] ?? "").split(separator: ":") {
             let text = (try? String(contentsOfFile: String(path), encoding: .utf8)) ?? ""
             let got = DispatchParser.inputs(in: text).map { $0.map(describe).joined(separator: "; ") } ?? "nil"

@@ -196,7 +196,7 @@ import SwiftUI
         var parts = [account.source.label]
         switch account.status {
         case .checking: parts.append("checking…")
-        case .ok: if let n = account.rateLimit { parts.append("\(n) API requests left this hour") }
+        case .ok: if let limit = account.rateLimit { parts.append(limit.detail) }
         case .invalid(let message): parts.append(message)
         }
         return parts.joined(separator: " · ")

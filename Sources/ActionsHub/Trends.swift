@@ -114,33 +114,43 @@ enum TrendsBuilder {
         .task { await load() }
     }
 
+    /// The slowest steps of a workflow's latest green run, and which jobs failed behind its
+    /// flaky commits (the attempt before the green one), up to 8.
+    nonisolated private static func details(of trend: WorkflowTrend, history: [WorkflowRun], repo: String, client: GitHubClient) async -> WorkflowTrend {
+        var trend = trend
+        if let latest = history.first(where: { $0.workflowFile == trend.id && $0.state == .success }),
+           let jobs = try? await client.jobs(repo, run: latest.id) {
+            trend.slowestSteps = jobs.flatMap { job in
+                (job.steps ?? []).compactMap { step in step.duration.map { ("\(job.name) › \(step.name)", $0) } }
+            }
+            .sorted { $0.1 > $1.1 }.prefix(5).map { $0 }
+        }
+        for f in trend.flakes.indices.prefix(8) {
+            let sha = trend.flakes[f].id
+            guard let green = history.first(where: { $0.headSha == sha && $0.workflowFile == trend.id && $0.state == .success }) else { continue }
+            if let failedRun = history.first(where: { $0.headSha == sha && $0.workflowFile == trend.id && $0.state == .failure }),
+               let jobs = try? await client.jobs(repo, run: failedRun.id) {
+                trend.flakes[f].jobs = jobs.filter { $0.state == .failure }.map(\.name)
+            } else if let attempt = green.runAttempt, attempt > 1,
+                      let jobs = try? await client.attemptJobs(repo, run: green.id, attempt: attempt - 1) {
+                trend.flakes[f].jobs = jobs.filter { $0.state == .failure }.map(\.name)
+            }
+        }
+        return trend
+    }
+
     private func load() async {
         guard let account = model.account(for: repo) else { error = "No account can see this repo."; return }
         let client = account.client
         do {
             let history = try await client.runHistory(repo)
             var built = TrendsBuilder.build(history)
-            for i in built.indices {
-                // Slowest steps of the latest green run.
-                if let latest = history.first(where: { $0.workflowFile == built[i].id && $0.state == .success }),
-                   let jobs = try? await client.jobs(repo, run: latest.id) {
-                    built[i].slowestSteps = jobs.flatMap { job in
-                        (job.steps ?? []).compactMap { step in step.duration.map { ("\(job.name) › \(step.name)", $0) } }
-                    }
-                    .sorted { $0.1 > $1.1 }.prefix(5).map { $0 }
+            // Each workflow's lookups are independent: run them 4 workflows at a time.
+            for start in stride(from: 0, to: built.count, by: 4) {
+                let tasks = built[start..<min(start + 4, built.count)].map { trend in
+                    Task { await Self.details(of: trend, history: history, repo: repo, client: client) }
                 }
-                // Which jobs failed behind a flaky commit (the attempt before the green one).
-                for f in built[i].flakes.indices.prefix(8) {
-                    let sha = built[i].flakes[f].id
-                    guard let green = history.first(where: { $0.headSha == sha && $0.workflowFile == built[i].id && $0.state == .success }) else { continue }
-                    if let failedRun = history.first(where: { $0.headSha == sha && $0.workflowFile == built[i].id && $0.state == .failure }),
-                       let jobs = try? await client.jobs(repo, run: failedRun.id) {
-                        built[i].flakes[f].jobs = jobs.filter { $0.state == .failure }.map(\.name)
-                    } else if let attempt = green.runAttempt, attempt > 1,
-                              let jobs = try? await client.attemptJobs(repo, run: green.id, attempt: attempt - 1) {
-                        built[i].flakes[f].jobs = jobs.filter { $0.state == .failure }.map(\.name)
-                    }
-                }
+                for (offset, task) in tasks.enumerated() { built[start + offset] = await task.value }
             }
             trends = built
         } catch {

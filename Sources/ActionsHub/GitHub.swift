@@ -148,8 +148,27 @@ struct LogExcerpt: Hashable {
     /// Index in `lines` of the first error line.
     var errorLine: Int?
     var totalLines: Int
+    /// The log was too big and only its end was read (`maxBytes`).
+    var truncated = false
 
     static let before = 120, after = 30, tail = 200
+    /// Most of a log read into memory; a bigger one is read from its end.
+    static let maxBytes = 16 << 20
+
+    /// Reads a downloaded log file, at most its last `maxBytes`.
+    static func make(file: URL) throws -> LogExcerpt {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        try handle.seek(toOffset: start)
+        var text = String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
+        // Starting mid-file: drop the partial first line.
+        if start > 0, let newline = text.firstIndex(of: "\n") { text = String(text[text.index(after: newline)...]) }
+        var excerpt = make(from: text)
+        excerpt.truncated = start > 0
+        return excerpt
+    }
 
     /// Strips timestamps and color codes, then keeps the lines around the first `##[error]`
     /// (or the last lines, if there's none). Runs off the main thread: logs can be megabytes.
@@ -300,6 +319,28 @@ struct PullRequestSnapshot {
 
 // MARK: - Client
 
+/// An account's REST API budget, from the last response's headers.
+struct RateLimit: Equatable {
+    let remaining: Int
+    /// Requests per hour (5,000 for a user token).
+    let limit: Int?
+    /// When the hour's budget starts over.
+    let reset: Date?
+
+    var percent: Int? { limit.flatMap { $0 > 0 ? Int((Double(remaining) / Double($0) * 100).rounded()) : nil } }
+
+    /// "4492/5000 per hour"
+    var label: String { limit.map { "\(remaining)/\($0) per hour" } ?? "\(remaining) left" }
+
+    /// "4,492 of 5,000 API requests left this hour (90%), resets at 9:14"
+    var detail: String {
+        var text = limit.map { "\(remaining.formatted()) of \($0.formatted()) API requests left this hour" } ?? "\(remaining.formatted()) API requests left this hour"
+        if let percent { text += " (\(percent)%)" }
+        if let reset { text += ", resets at \(reset.formatted(date: .omitted, time: .shortened))" }
+        return text
+    }
+}
+
 struct GitHubError: LocalizedError {
     let message: String
     /// HTTP status, when the error came from an API response.
@@ -318,7 +359,7 @@ actor GitHubClient {
     private let base = URL(string: "https://api.github.com")!
     /// Conditional-request cache: a 304 costs nothing against the rate limit.
     private var cache: [URL: (etag: String, data: Data)] = [:]
-    private(set) var rateLimitRemaining: Int?
+    private(set) var rateLimit: RateLimit?
 
     static let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -348,8 +389,12 @@ actor GitHubClient {
         if let cached = cache[url] { req.setValue(cached.etag, forHTTPHeaderField: "If-None-Match") }
         let (data, response) = try await URLSession.shared.data(for: req)
         guard let http = response as? HTTPURLResponse else { throw GitHubError(message: "No response") }
-        if let remaining = http.value(forHTTPHeaderField: "x-ratelimit-remaining") {
-            rateLimitRemaining = Int(remaining)
+        // Only the REST ("core") budget: search and others have their own, much smaller ones.
+        if (http.value(forHTTPHeaderField: "x-ratelimit-resource") ?? "core") == "core",
+           let remaining = http.value(forHTTPHeaderField: "x-ratelimit-remaining").flatMap(Int.init) {
+            rateLimit = RateLimit(remaining: remaining,
+                                  limit: http.value(forHTTPHeaderField: "x-ratelimit-limit").flatMap(Int.init),
+                                  reset: http.value(forHTTPHeaderField: "x-ratelimit-reset").flatMap(TimeInterval.init).map(Date.init(timeIntervalSince1970:)))
         }
         switch http.statusCode {
         case 304:
@@ -558,21 +603,22 @@ actor GitHubClient {
         let endpoint = url("/repos/\(fullName)/actions/jobs/\(job)/logs")
         let (data, response) = try await Self.noRedirect.data(for: request(endpoint))
         guard let http = response as? HTTPURLResponse else { throw GitHubError(message: "No response") }
-        var body = data
         if (300..<400).contains(http.statusCode) {
             guard let location = http.value(forHTTPHeaderField: "Location"), let signed = URL(string: location, relativeTo: endpoint)?.absoluteURL else {
                 throw GitHubError(message: "Log redirect without a location")
             }
-            let (logData, logResponse) = try await URLSession.shared.data(from: signed)
+            // To a file, not memory: a log can be hundreds of MB.
+            let (file, logResponse) = try await URLSession.shared.download(from: signed)
+            defer { try? FileManager.default.removeItem(at: file) }
             guard (logResponse as? HTTPURLResponse)?.statusCode == 200 else {
                 let status = (logResponse as? HTTPURLResponse)?.statusCode ?? 0
                 throw GitHubError(message: "Couldn't download the log (\(status))", status: status)
             }
-            body = logData
+            return try LogExcerpt.make(file: file)
         } else if !(200..<300).contains(http.statusCode) {
             throw Self.error(from: data, response: response)
         }
-        return LogExcerpt.make(from: String(decoding: body, as: UTF8.self))
+        return LogExcerpt.make(from: String(decoding: data, as: UTF8.self))
     }
 
     /// Errors and warnings with file and line. An Actions job's id is also its check run's id.
