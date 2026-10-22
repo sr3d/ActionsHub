@@ -158,8 +158,13 @@ import AppKit
     var body: some View {
         HStack(alignment: .top, spacing: 8 * z) {
             // CI status of the head commit.
-            Image(systemName: pr.ci?.symbol ?? "circle.dashed")
-                .foregroundStyle(pr.ci?.color ?? .secondary)
+            Group {
+                if let ci = pr.ci {
+                    StateIcon(state: ci)
+                } else {
+                    Image(systemName: "circle.dashed").foregroundStyle(.secondary)
+                }
+            }
                 .padding(.top, 1 * z)
                 .help(pr.ciState.map { "Checks: \($0.lowercased())" } ?? "No checks")
             VStack(alignment: .leading, spacing: 3 * z) {

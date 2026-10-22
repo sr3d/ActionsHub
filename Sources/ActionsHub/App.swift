@@ -13,7 +13,7 @@ struct ActionsHubApp: App {
                 .environment(\.zoom, zoom)
                 .environment(model)
             .frame(minWidth: 720 * zoom, minHeight: 420 * zoom)
-            .onAppear { model.start() }
+            .onAppear { model.start(); ResizeBench.runIfRequested() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model.refreshVisible()
             }
@@ -87,6 +87,14 @@ struct ActionsHubApp: App {
                         .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
                 }
             }
+        }
+
+        // ⌘, — GitHub accounts.
+        Settings {
+            AccountsSettingsView()
+                .zFont(.body)
+                .environment(\.zoom, zoom)
+                .environment(model)
         }
     }
 }
@@ -220,12 +228,18 @@ extension View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14 * z) {
             Text("Connect to GitHub").zFont(.title2, weight: .bold)
-            Text("No token found from `gh auth token` or GH_TOKEN. Paste a personal access token with the **repo** and **workflow** scopes. It is stored in your Keychain.")
+            Text("No GitHub account found in the GitHub CLI, GH_TOKEN, or your Keychain. Paste a personal access token with the **repo** and **workflow** scopes — it's stored in your Keychain.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Or run `gh auth login` in Terminal, then relaunch. Add more accounts later in Settings (⌘,).")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             SecureField("ghp_…", text: $token)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { model.saveToken(token) }
+            if let error = model.tokenError {
+                Text(error).foregroundStyle(.red)
+            }
             HStack {
                 Button("Create a token…") {
                     model.openInBrowser(URL(string: "https://github.com/settings/tokens/new?scopes=repo,workflow&description=ActionsHub")!)

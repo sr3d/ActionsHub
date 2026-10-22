@@ -111,6 +111,7 @@ import AppKit
                 StatusDot(state: model.summary(for: name))
                 Text(name).lineLimit(1)
                 Spacer()
+                if model.multiAccount { AccountTag(login: model.account(for: name)?.login) }
                 if model.isPinned(name) {
                     Label("In group", systemImage: "checkmark.circle.fill")
                         .zFont(.caption)

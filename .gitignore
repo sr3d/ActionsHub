@@ -7,3 +7,8 @@ dist/
 # Icon build artifacts — AppIcon.icns and the 1024 master are committed; the iconset is regenerated.
 Icon/AppIcon.iconset/
 !Icon/AppIcon-1024.png
+
+# IdeasLoops task list (internal)
+.projectinfo
+.projectinfo-archive.json
+.ideasloops/

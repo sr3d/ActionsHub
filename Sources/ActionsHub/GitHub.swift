@@ -15,6 +15,14 @@ struct Repo: Codable, Identifiable, Hashable {
     let htmlUrl: URL
     let pushedAt: Date?
     let archived: Bool?
+    /// What the fetching account may do here; used to pick between accounts that both see a repo.
+    let permissions: Permissions?
+
+    struct Permissions: Codable, Hashable {
+        let admin: Bool?
+        let push: Bool?
+        let pull: Bool?
+    }
 
     var actionsURL: URL { htmlUrl.appendingPathComponent("actions") }
 }
@@ -165,6 +173,8 @@ enum RunState: Equatable {
 // MARK: - Pull requests
 
 struct PullRequest: Identifiable, Hashable {
+    /// Login of the account that fetched this PR — "you" for review requests and authorship.
+    var viewer = ""
     let url: URL
     let number: Int
     let title: String
@@ -207,7 +217,15 @@ struct PullRequestSnapshot {
 
 struct GitHubError: LocalizedError {
     let message: String
+    /// HTTP status, when the error came from an API response.
+    var status: Int? = nil
+    /// A 403/429 from the rate limit, not from the token lacking access.
+    var rateLimited = false
     var errorDescription: String? { message }
+    /// The token itself was rejected (revoked / expired), as opposed to "no access to this repo".
+    var isAuthFailure: Bool { status == 401 }
+    /// This account can't see the repo; another account might.
+    var isNoAccess: Bool { (status == 404 || status == 403) && !rateLimited }
 }
 
 actor GitHubClient {
@@ -256,14 +274,18 @@ actor GitHubClient {
             if let etag = http.value(forHTTPHeaderField: "ETag") { cache[url] = (etag, data) }
             return (data, http)
         default:
-            throw Self.error(from: data, status: http.statusCode)
+            throw Self.error(from: data, response: http)
         }
     }
 
-    private static func error(from data: Data, status: Int) -> GitHubError {
+    private static func error(from data: Data, response: URLResponse?) -> GitHubError {
         struct Body: Decodable { let message: String? }
+        let http = response as? HTTPURLResponse
+        let status = http?.statusCode ?? 0
         let msg = (try? JSONDecoder().decode(Body.self, from: data))?.message ?? "HTTP \(status)"
-        return GitHubError(message: "\(msg) (\(status))")
+        let rateLimited = status == 429 || (status == 403 && (http?.value(forHTTPHeaderField: "x-ratelimit-remaining") == "0"
+            || msg.localizedCaseInsensitiveContains("rate limit")))
+        return GitHubError(message: "\(msg) (\(status))", status: status, rateLimited: rateLimited)
     }
 
     func get<T: Decodable>(_ type: T.Type, _ path: String) async throws -> T {
@@ -274,7 +296,7 @@ actor GitHubClient {
     func post(_ path: String) async throws {
         let (data, response) = try await URLSession.shared.data(for: request(url(path), method: "POST"))
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(status) else { throw Self.error(from: data, status: status) }
+        guard (200..<300).contains(status) else { throw Self.error(from: data, response: response) }
     }
 
     /// Follows `Link: rel="next"` headers up to `maxPages`.
@@ -306,6 +328,11 @@ actor GitHubClient {
 
     func repos() async throws -> [Repo] {
         try await getAll(Repo.self, "/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=100")
+    }
+
+    /// The login this token belongs to.
+    func viewer() async throws -> String {
+        try await get(Owner.self, "/user").login
     }
 
     func repo(_ fullName: String) async throws -> Repo {
@@ -376,7 +403,7 @@ actor GitHubClient {
         req.httpBody = try JSONSerialization.data(withJSONObject: ["query": query, "variables": variables])
         let (data, response) = try await URLSession.shared.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(status) else { throw Self.error(from: data, status: status) }
+        guard (200..<300).contains(status) else { throw Self.error(from: data, response: response) }
         let body = try Self.decoder.decode(GraphQLBody.self, from: data)
         if let message = body.errors?.first?.message { throw GitHubError(message: message) }
         let results = body.data ?? [:]
@@ -387,7 +414,8 @@ actor GitHubClient {
             let page = results["s\(i)"]
             if (page?.issueCount ?? 0) > (page?.nodes?.count ?? 0) { snapshot.truncated = true }
             for node in page?.nodes ?? [] {
-                guard let pr = node.pullRequest, seen.insert(pr.url).inserted else { continue }
+                guard var pr = node.pullRequest, seen.insert(pr.url).inserted else { continue }
+                pr.viewer = snapshot.viewer
                 snapshot.prs.append(pr)
             }
             snapshot.direct.formUnion(results["d\(i)"]?.nodes?.compactMap(\.url) ?? [])
@@ -449,64 +477,5 @@ private struct PRNode: Decodable {
                            author: author?.login, isDraft: isDraft ?? false, updatedAt: updatedAt,
                            branch: headRefName ?? "", reviewDecision: reviewDecision,
                            ciState: commits?.nodes?.last?.commit.statusCheckRollup?.state)
-    }
-}
-
-// MARK: - Token discovery
-
-enum TokenSource {
-    /// Tries the environment, then the `gh` CLI, then a token saved in the Keychain.
-    static func discover() -> String? {
-        let env = ProcessInfo.processInfo.environment
-        for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
-            if let t = env[key], !t.isEmpty { return t }
-        }
-        if let t = ghToken() { return t }
-        return Keychain.load()
-    }
-
-    private static func ghToken() -> String? {
-        // GUI apps get a minimal PATH, so look in the usual install locations.
-        let candidates = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
-        guard let gh = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return nil }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: gh)
-        proc.arguments = ["auth", "token"]
-        let out = Pipe()
-        proc.standardOutput = out
-        proc.standardError = Pipe()
-        do { try proc.run() } catch { return nil }
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else { return nil }
-        let token = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return token?.isEmpty == false ? token : nil
-    }
-}
-
-enum Keychain {
-    private static let service = "ActionsHub"
-    private static let account = "github-token"
-
-    static func save(_ token: String) {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                    kSecAttrService as String: service,
-                                    kSecAttrAccount as String: account]
-        SecItemDelete(query as CFDictionary)
-        var add = query
-        add[kSecValueData as String] = Data(token.utf8)
-        SecItemAdd(add as CFDictionary, nil)
-    }
-
-    static func load() -> String? {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                    kSecAttrService as String: service,
-                                    kSecAttrAccount as String: account,
-                                    kSecReturnData as String: true,
-                                    kSecMatchLimit as String: kSecMatchLimitOne]
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
     }
 }

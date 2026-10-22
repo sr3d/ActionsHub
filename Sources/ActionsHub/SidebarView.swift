@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Shows only the current group's repos, plus the group switcher and the run filter.
 @MainActor struct SidebarView: View {
@@ -62,10 +63,7 @@ import SwiftUI
                 .buttonStyle(.borderless)
                 .help("Add repositories to this group (⇧⌘K)")
                 Spacer()
-                if let remaining = model.rateLimitRemaining {
-                    Text("API \(remaining)").zFont(.caption2).foregroundStyle(.secondary)
-                        .help("GitHub API requests left this hour")
-                }
+                RateLimitFooter()
             }
             .padding(.horizontal, 12 * z)
             .padding(.vertical, 7 * z)
@@ -318,6 +316,9 @@ import SwiftUI
             Button("Move Up") { model.movePin(fullName, by: -1) }
             Button("Move Down") { model.movePin(fullName, by: 1) }
             Divider()
+            if model.multiAccount || model.accountOverrides[fullName] != nil {
+                AccountMenu(repo: fullName)
+            }
             Menu("Color") {
                 ForEach(RepoColor.allCases, id: \.self) { c in
                     Toggle(c.name, isOn: Binding(get: { model.color(for: fullName) == c },
@@ -331,6 +332,79 @@ import SwiftUI
             Button("Open Pull Requests in Browser") { model.openInBrowser(URL(string: "https://github.com/\(fullName)/pulls")!) }
             Divider()
             Button("Remove from Group") { model.togglePin(fullName) }
+        }
+    }
+}
+
+/// API requests left: one number with a single account, one per login otherwise. An invalid
+/// account shows a warning that opens Settings.
+@MainActor private struct RateLimitFooter: View {
+    @Environment(\.zoom) private var z
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let accounts = model.accounts.accounts
+        if accounts.count <= 1 {
+            if let remaining = accounts.first?.rateLimit {
+                Text("API \(remaining)").zFont(.caption2).foregroundStyle(.secondary)
+                    .help("GitHub API requests left this hour")
+            }
+            warning(for: accounts)
+        } else {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8 * z) {
+                    ForEach(accounts) { a in
+                        Text("\(a.login) \(a.rateLimit.map(String.init) ?? "–")").fixedSize()
+                    }
+                    warning(for: accounts)
+                }
+                HStack(spacing: 4 * z) {
+                    Text("API \(accounts.compactMap(\.rateLimit).min().map(String.init) ?? "–")").fixedSize()
+                    warning(for: accounts)
+                }
+            }
+            .zFont(.caption2)
+            .foregroundStyle(.secondary)
+            .help(accounts.map { "\($0.login): \($0.rateLimit.map(String.init) ?? "?") API requests left" }.joined(separator: "\n"))
+        }
+    }
+
+    @ViewBuilder private func warning(for accounts: [Account]) -> some View {
+        let bad = accounts.filter { !$0.isUsable }
+        if !bad.isEmpty {
+            Button { AppModel.openSettingsWindow() } label: {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            }
+            .buttonStyle(.plain)
+            .help(bad.map { a -> String in
+                if case .invalid(let msg) = a.status { return "\(a.login): \(msg)" }
+                return a.login
+            }.joined(separator: "\n") + "\nClick to open Settings")
+        }
+    }
+}
+
+/// "Use Account" submenu: automatic, or pin the repo to one account.
+@MainActor private struct AccountMenu: View {
+    @Environment(AppModel.self) private var model
+    let repo: String
+
+    var body: some View {
+        let override = model.accountOverrides[repo]
+        Menu("Use Account") {
+            Toggle("Automatic (@\(model.autoAccount(for: repo)?.login ?? "none"))", isOn: Binding(
+                get: { override == nil },
+                set: { _ in model.setAccountOverride(nil, for: repo) }))
+            Divider()
+            ForEach(model.accounts.accounts) { account in
+                let listed = model.repoAccounts[repo]?.contains { $0.lowercased() == account.id } ?? false
+                Toggle("@\(account.login)" + (listed ? "" : " (not in its repo list)"), isOn: Binding(
+                    get: { override?.lowercased() == account.id },
+                    set: { _ in model.setAccountOverride(account.login, for: repo) }))
+            }
+            if let override, model.accounts.account(override) == nil {
+                Text("@\(override) (unavailable)")
+            }
         }
     }
 }
@@ -379,7 +453,9 @@ import SwiftUI
             .frame(width: 9 * z, height: 9 * z)
             .overlay {
                 if state == .running {
-                    Circle().stroke(Color.orange.opacity(0.5), lineWidth: 3 * z).scaleEffect(1.5)
+                    // Spinning partial ring; runs regardless of Reduce Motion.
+                    SpinnerRing(color: .orange, lineWidth: 2 * z)
+                        .frame(width: 15 * z, height: 15 * z)
                 }
             }
             .help(state?.label ?? "No recent runs loaded")

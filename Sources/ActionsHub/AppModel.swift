@@ -10,8 +10,9 @@ final class AppModel {
 
     var auth: Auth = .checking
     /// Seeded from the on-disk cache so the sidebar and ⌘K work instantly at launch.
-    var repos: [Repo] = AppModel.loadCachedRepos()
+    var repos: [Repo] = AppModel.cached.repos
     var reposLoading = false
+    private var reposGeneration = 0
     var reposError: String?
 
     // MARK: Groups (presets)
@@ -94,7 +95,27 @@ final class AppModel {
 
     // MARK: Pull requests
 
-    var prSnapshot: PullRequestSnapshot?
+    /// One snapshot per account (each covers the repos that resolve to it).
+    var prByAccount: [String: PullRequestSnapshot] = [:] { didSet { rebuildPRSnapshot() } }
+
+    /// All accounts' PRs merged. Each PR keeps the `viewer` of the account that fetched it.
+    /// Stored, not computed: every sidebar row reads it on each render.
+    private(set) var prSnapshot: PullRequestSnapshot?
+
+    /// Call when the PRs or the repo → account mapping change.
+    private func rebuildPRSnapshot() {
+        guard !prByAccount.isEmpty else { prSnapshot = nil; return }
+        var merged = PullRequestSnapshot(viewer: "", prs: [], direct: [], anyRequest: [], truncated: false)
+        for (login, snap) in prByAccount {
+            // Skip repos that have since moved to another account (stale snapshot).
+            merged.prs += snap.prs.filter { account(for: $0.repo)?.id ?? login.lowercased() == login.lowercased() }
+            merged.direct.formUnion(snap.direct)
+            merged.anyRequest.formUnion(snap.anyRequest)
+            merged.truncated = merged.truncated || snap.truncated
+        }
+        merged.prs.sort { $0.updatedAt > $1.updatedAt }
+        prSnapshot = merged
+    }
     var prLoading = false
     var prError: String?
     var prUpdated: Date?
@@ -118,18 +139,37 @@ final class AppModel {
     /// (e.g. a repo opened with ⌘K in single-pane mode).
     private var prRepos: [String] { pinned + visibleRepos.filter { !pinned.contains($0) } }
 
+    /// One GraphQL query per account, over the repos that resolve to it, in parallel.
     func refreshPRs() async {
         let repos = prRepos
-        guard let client, !prLoading, !repos.isEmpty else { return }
+        guard !prLoading, !repos.isEmpty else { return }
+        var byLogin: [String: (client: GitHubClient, repos: [String])] = [:]
+        for repo in repos {
+            guard let account = account(for: repo) else { continue }
+            byLogin[account.login, default: (account.client, [])].repos.append(repo)
+        }
+        guard !byLogin.isEmpty else { return }
         prLoading = true
         defer { prLoading = false }
-        do {
-            prSnapshot = try await client.pullRequests(repos: repos)
-            prError = nil
-            prUpdated = Date()
-        } catch {
-            prError = error.localizedDescription
+
+        // Plain tasks, not a task group (see loadRepos).
+        let tasks = byLogin.map { login, work in
+            (login, Task { try await work.client.pullRequests(repos: work.repos) })
         }
+        var results: [String: Result<PullRequestSnapshot, Error>] = [:]
+        for (login, task) in tasks { results[login] = await task.result }
+        var errors: [String] = []
+        for (login, result) in results.sorted(by: { $0.key < $1.key }) {
+            switch result {
+            case .success(let snap): prByAccount[login] = snap
+            case .failure(let error):
+                if (error as? GitHubError)?.isAuthFailure == true { accounts.markInvalid(login, error.localizedDescription) }
+                errors.append(multiAccount ? "\(login): \(error.localizedDescription)" : error.localizedDescription)
+            }
+        }
+        prByAccount = prByAccount.filter { byLogin[$0.key] != nil }
+        prError = errors.isEmpty ? nil : errors.joined(separator: "\n")
+        if errors.count < results.count { prUpdated = Date() }
     }
 
     enum PRSection: String, CaseIterable {
@@ -147,7 +187,7 @@ final class AppModel {
         let groupRepos = repo.map { Set([$0]) } ?? Set(pinned)
         var buckets: [PRSection: [PullRequest]] = [:]
         for pr in snap.prs where groupRepos.contains(pr.repo) {
-            let mine = pr.author == snap.viewer
+            let mine = pr.author == pr.viewer
             if !prIncludeStale, Date().timeIntervalSince(pr.updatedAt) > Self.staleAfter { continue }
             if !prIncludeDrafts, pr.isDraft, !mine { continue }
             let section: PRSection =
@@ -308,7 +348,6 @@ final class AppModel {
     var expandedRuns: Set<Int> = []
     var workflowFilter: [String: String] = [:]
     var actionError: String?
-    var rateLimitRemaining: Int?
     var showSwitcher = false
     /// When true, the palette adds repos to the current group instead of opening them.
     var switcherAddsToGroup = false
@@ -322,30 +361,110 @@ final class AppModel {
         if !groups.contains(where: { $0.id == currentGroupID }) { currentGroupID = groups[0].id }
     }
 
-    private var client: GitHubClient?
     private var pollTask: Task<Void, Never>?
+
+    // MARK: Accounts
+
+    let accounts = AccountStore()
+    /// fullName → logins whose repo list includes it, best first (owner, push access, account order).
+    var repoAccounts: [String: [String]] = AppModel.cached.accounts { didSet { rebuildPRSnapshot() } }
+    /// Manual per-repo choice ("Use Account"). Persisted.
+    var accountOverrides: [String: String] = (UserDefaults.standard.dictionary(forKey: "repoAccountOverrides") as? [String: String]) ?? [:] {
+        didSet {
+            UserDefaults.standard.set(accountOverrides, forKey: "repoAccountOverrides")
+            rebuildPRSnapshot()
+        }
+    }
+    /// Account found to work for a repo by trying them (open by name, or after a 404). Persisted.
+    var accountHints: [String: String] = (UserDefaults.standard.dictionary(forKey: "repoAccountHints") as? [String: String]) ?? [:] {
+        didSet {
+            UserDefaults.standard.set(accountHints, forKey: "repoAccountHints")
+            rebuildPRSnapshot()
+        }
+    }
+    /// Repos already probed across accounts this session, so a missing repo isn't retried forever.
+    private var probed: Set<String> = []
+    var tokenError: String?
+
+    var multiAccount: Bool { accounts.accounts.count > 1 }
+
+    /// The account used for everything about `repo`: a manual override when usable, else automatic.
+    func account(for repo: String) -> Account? {
+        if let login = accountOverrides[repo], let account = accounts.account(login), account.isUsable { return account }
+        return autoAccount(for: repo)
+    }
+
+    /// Automatic choice: an account proven to work, then one that lists the repo, then the
+    /// owner's account, then the default account.
+    func autoAccount(for repo: String) -> Account? {
+        let usable = accounts.usable
+        func find(_ login: String?) -> Account? { login.flatMap { l in usable.first { $0.id == l.lowercased() } } }
+        if let hinted = find(accountHints[repo]) { return hinted }
+        for login in repoAccounts[repo] ?? [] { if let a = find(login) { return a } }
+        if let owner = find(repo.split(separator: "/").first.map(String.init)) { return owner }
+        return usable.first
+    }
+
+    /// Order to try accounts for a repo nobody has listed yet: the owner's account first.
+    private func candidates(for repo: String) -> [Account] {
+        let owner = repo.split(separator: "/").first.map { $0.lowercased() } ?? ""
+        let usable = accounts.usable
+        return usable.filter { $0.id == owner } + usable.filter { $0.id != owner }
+    }
+
+    func setAccountOverride(_ login: String?, for repo: String) {
+        accountOverrides[repo] = login
+        runs[repo] = nil
+        runsError[repo] = nil
+        probed.remove(repo)
+        Task {
+            await refreshRuns(repo)
+            await refreshPRs()
+        }
+    }
 
     // MARK: Lifecycle
 
+    private var started = false
+
     func start() {
-        guard client == nil else { return }
-        Task.detached(priority: .userInitiated) {
-            let token = TokenSource.discover()
-            await MainActor.run {
-                if let token { self.connect(token) } else { self.auth = .needsToken }
+        guard !started else { return }
+        started = true
+        Task {
+            await accounts.discover()
+            await accountsChanged()
+        }
+    }
+
+    /// First-launch token screen.
+    func saveToken(_ token: String) {
+        Task {
+            do {
+                try await accounts.addPAT(token)
+                tokenError = nil
+                await accountsChanged()
+            } catch {
+                tokenError = error.localizedDescription
             }
         }
     }
 
-    func saveToken(_ token: String) {
-        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        Keychain.save(trimmed)
-        connect(trimmed)
+    /// Call after accounts are added, removed or reloaded.
+    func accountsChanged() async {
+        if accounts.accounts.isEmpty {
+            auth = .needsToken
+            return
+        }
+        probed = []
+        if auth != .ready {
+            connect()
+        } else {
+            await loadRepos()
+            refreshVisible()
+        }
     }
 
-    private func connect(_ token: String) {
-        client = GitHubClient(token: token)
+    private func connect() {
         auth = .ready
         Task { await loadRepos() }
         for repo in visibleRepos { Task { await refreshRuns(repo) } }
@@ -396,46 +515,126 @@ final class AppModel {
 
     // MARK: Loading
 
+    /// Every account's repos in parallel, merged by name. An account that fails keeps its
+    /// cached repos so a flaky network or revoked token doesn't empty ⌘K.
     func loadRepos() async {
-        guard let client else { return }
+        let usable = accounts.usable
+        guard !usable.isEmpty else { return }
+        // A newer load (e.g. after Reload from gh) supersedes this one; drop our results.
+        reposGeneration += 1
+        let generation = reposGeneration
         reposLoading = true
-        defer { reposLoading = false }
-        do {
-            repos = try await client.repos()
-                .filter { $0.archived != true }
-                .sorted { ($0.pushedAt ?? .distantPast) > ($1.pushedAt ?? .distantPast) }
-            reposError = nil
-            Self.cacheRepos(repos)
-            for name in pinned { await refreshRuns(name) }
-        } catch {
-            reposError = error.localizedDescription
+        defer { if generation == reposGeneration { reposLoading = false } }
+
+        // Plain tasks rather than a task group: in this main-actor method the group's
+        // `for await` ended before its children finished, silently dropping every account's repos.
+        let tasks = usable.map { account in
+            let client = account.client
+            return (account.login, Task { try await client.repos() })
         }
-        rateLimitRemaining = await client.rateLimitRemaining
+        var results: [String: Result<[Repo], Error>] = [:]
+        for (login, task) in tasks { results[login] = await task.result }
+        guard generation == reposGeneration else { return }
+
+        var seen: [String: [String: Repo]] = [:]   // fullName → login → that account's view
+        var errors: [String] = []
+        for account in usable {
+            switch results[account.login] {
+            case .success(let list):
+                for repo in list where repo.archived != true { seen[repo.fullName, default: [:]][account.login] = repo }
+            case .failure(let error):
+                if (error as? GitHubError)?.isAuthFailure == true { accounts.markInvalid(account.login, error.localizedDescription) }
+                errors.append(multiAccount ? "\(account.login): \(error.localizedDescription)" : error.localizedDescription)
+                for (name, logins) in repoAccounts where logins.contains(account.login) {
+                    if let cached = repos.first(where: { $0.fullName == name }) { seen[name, default: [:]][account.login] = cached }
+                }
+            case nil:
+                break
+            }
+            await accounts.noteRateLimit(account.login)
+        }
+
+        let order = usable.map(\.login)
+        var lists: [String: [String]] = [:]
+        var merged: [Repo] = []
+        for (name, views) in seen {
+            let owner = name.split(separator: "/").first.map { $0.lowercased() } ?? ""
+            func rank(_ login: String) -> (Int, Int, Int) {
+                (login.lowercased() == owner ? 0 : 1,
+                 views[login]?.permissions?.push == true ? 0 : 1,
+                 order.firstIndex(of: login) ?? Int.max)
+            }
+            let ranked = views.keys.sorted { rank($0) < rank($1) }
+            lists[name] = ranked
+            merged.append(views[ranked[0]]!)
+        }
+        // Keep repos opened by name that no account lists (e.g. other people's public repos).
+        for repo in repos where seen[repo.fullName] == nil && accountHints[repo.fullName] != nil {
+            merged.append(repo)
+        }
+        repos = merged.sorted { ($0.pushedAt ?? .distantPast) > ($1.pushedAt ?? .distantPast) }
+        repoAccounts = lists
+        reposError = errors.isEmpty ? nil : errors.joined(separator: "\n")
+        Self.saveCache(repos: repos, accounts: lists)
+        for name in pinned { await refreshRuns(name) }
     }
 
     func refreshRuns(_ fullName: String) async {
-        guard let client, !runsLoading.contains(fullName) else { return }
+        guard !runsLoading.contains(fullName) else { return }
         runsLoading.insert(fullName)
         defer { runsLoading.remove(fullName) }
-        do {
-            let fetched = try await client.runs(fullName)
-            if runs[fullName] != fetched { runs[fullName] = fetched }
-            runsError[fullName] = nil
-            lastUpdated[fullName] = Date()
-        } catch {
-            runsError[fullName] = error.localizedDescription
+        for _ in 0..<2 {
+            guard let account = account(for: fullName) else { return }
+            do {
+                let fetched = try await account.client.runs(fullName)
+                if runs[fullName] != fetched { runs[fullName] = fetched }
+                runsError[fullName] = nil
+                lastUpdated[fullName] = Date()
+                await accounts.noteRateLimit(account.login)
+                return
+            } catch {
+                await accounts.noteRateLimit(account.login)
+                if await recover(fullName, from: error, account: account) { continue }
+                runsError[fullName] = multiAccount ? "\(error.localizedDescription) (as \(account.login))" : error.localizedDescription
+                return
+            }
         }
-        rateLimitRemaining = await client.rateLimitRemaining
+    }
+
+    /// After a failed call: a rejected token marks its account invalid; "no access" tries the
+    /// other accounts once. Returns true when a retry would use a different account.
+    private func recover(_ repo: String, from error: Error, account: Account) async -> Bool {
+        guard let err = error as? GitHubError else { return false }
+        if err.isAuthFailure {
+            accounts.markInvalid(account.login, err.message)
+            return self.account(for: repo).map { $0.id != account.id } ?? false
+        }
+        guard err.isNoAccess, accountOverrides[repo] == nil, !probed.contains(repo) else { return false }
+        // Only a definite "no access" from every other account stops future probes; a
+        // rate limit or network error there may clear up, so try again next time.
+        var definite = true
+        for other in candidates(for: repo) where other.id != account.id {
+            do {
+                _ = try await other.client.repo(repo)
+                accountHints[repo] = other.login
+                return true
+            } catch {
+                if (error as? GitHubError)?.isNoAccess != true { definite = false }
+            }
+        }
+        if definite { probed.insert(repo) }
+        return false
     }
 
     func loadJobs(repo: String, run: Int) async {
-        guard let client else { return }
+        guard let account = account(for: repo) else { return }
         do {
-            let fetched = try await client.jobs(repo, run: run)
+            let fetched = try await account.client.jobs(repo, run: run)
             if jobs[run] != fetched { jobs[run] = fetched }
         } catch {
             actionError = error.localizedDescription
         }
+        await accounts.noteRateLimit(account.login)
     }
 
     func toggleExpanded(repo: String, run: Int) {
@@ -458,34 +657,48 @@ final class AppModel {
     }
 
     private func perform(_ repo: String, _ action: @escaping (GitHubClient) async throws -> Void) {
-        guard let client else { return }
+        guard let account = account(for: repo) else { return }
         Task {
             do {
-                try await action(client)
+                try await action(account.client)
                 try? await Task.sleep(for: .seconds(2))
                 await refreshRuns(repo)
             } catch {
-                actionError = error.localizedDescription
+                actionError = multiAccount ? "\(error.localizedDescription) (as \(account.login))" : error.localizedDescription
             }
         }
+    }
+
+    /// Finds a repo by name with whichever account can see it, remembering that account.
+    private func lookup(_ name: String) async throws -> Repo {
+        var lastError: Error = GitHubError(message: "No GitHub account available")
+        for account in candidates(for: name) {
+            do {
+                let repo = try await account.client.repo(name)
+                accountHints[repo.fullName] = account.login
+                if !repos.contains(where: { $0.fullName == repo.fullName }) {
+                    repos.append(repo)
+                    Self.saveCache(repos: repos, accounts: repoAccounts)
+                }
+                return repo
+            } catch {
+                if (error as? GitHubError)?.isAuthFailure == true { accounts.markInvalid(account.login, error.localizedDescription) }
+                lastError = error
+            }
+        }
+        throw lastError
     }
 
     /// Opens a repo that isn't in the user's list (e.g. someone else's public repo).
     func open(fullName: String) {
         let name = fullName.trimmingCharacters(in: .whitespaces)
-        if repos.contains(where: { $0.fullName.caseInsensitiveCompare(name) == .orderedSame }) {
-            selected = repos.first { $0.fullName.caseInsensitiveCompare(name) == .orderedSame }?.fullName
+        if let known = repos.first(where: { $0.fullName.caseInsensitiveCompare(name) == .orderedSame }) {
+            selected = known.fullName
             return
         }
-        guard let client else { return }
         Task {
-            do {
-                let repo = try await client.repo(name)
-                if !repos.contains(repo) { repos.append(repo) }
-                selected = repo.fullName
-            } catch {
-                actionError = "\(name): \(error.localizedDescription)"
-            }
+            do { selected = try await lookup(name).fullName }
+            catch { actionError = "\(name): \(error.localizedDescription)" }
         }
     }
 
@@ -496,11 +709,9 @@ final class AppModel {
             if !isPinned(known.fullName) { togglePin(known.fullName) }
             return
         }
-        guard let client else { return }
         Task {
             do {
-                let repo = try await client.repo(name)
-                if !repos.contains(repo) { repos.append(repo) }
+                let repo = try await lookup(name)
                 if !isPinned(repo.fullName) { togglePin(repo.fullName) }
             } catch {
                 actionError = "\(name): \(error.localizedDescription)"
@@ -508,21 +719,45 @@ final class AppModel {
         }
     }
 
-    private static var repoCacheURL: URL {
+    // MARK: Repo cache
+
+    /// v2 adds which accounts list each repo. v1 (`repos.json`, a bare array) is still read
+    /// as a fallback and left in place.
+    private struct RepoCache: Codable {
+        var version = 2
+        var repos: [Repo]
+        var accounts: [String: [String]]
+    }
+
+    private static let cached: RepoCache = {
+        if let data = try? Data(contentsOf: cacheDir.appendingPathComponent("repos-v2.json")),
+           let cache = try? JSONDecoder().decode(RepoCache.self, from: data) {
+            return cache
+        }
+        if let data = try? Data(contentsOf: cacheDir.appendingPathComponent("repos.json")),
+           let repos = try? JSONDecoder().decode([Repo].self, from: data) {
+            return RepoCache(repos: repos, accounts: [:])
+        }
+        return RepoCache(repos: [], accounts: [:])
+    }()
+
+    private static var cacheDir: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ActionsHub", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("repos.json")
+        return dir
     }
 
-    private static func loadCachedRepos() -> [Repo] {
-        guard let data = try? Data(contentsOf: repoCacheURL) else { return [] }
-        return (try? JSONDecoder().decode([Repo].self, from: data)) ?? []
+    /// Encodes and writes off the main thread. Writes run one at a time, in order, so an
+    /// older list can never land after a newer one.
+    private static func saveCache(repos: [Repo], accounts: [String: [String]]) {
+        let cache = RepoCache(repos: repos, accounts: accounts)
+        let url = cacheDir.appendingPathComponent("repos-v2.json")
+        cacheQueue.async {
+            try? JSONEncoder().encode(cache).write(to: url, options: .atomic)
+        }
     }
-
-    private static func cacheRepos(_ repos: [Repo]) {
-        try? JSONEncoder().encode(repos).write(to: repoCacheURL, options: .atomic)
-    }
+    private static let cacheQueue = DispatchQueue(label: "ActionsHub.repoCache", qos: .utility)
 
     // MARK: Pins
 
@@ -575,7 +810,29 @@ final class AppModel {
         return latest.state
     }
 
-    func openInBrowser(_ url: URL) { NSWorkspace.shared.open(url) }
+    /// Chrome profile directory to open each account's links in (by lowercased login).
+    var browserProfiles: [String: String] = (UserDefaults.standard.dictionary(forKey: "accountBrowserProfiles") as? [String: String]) ?? [:] {
+        didSet { UserDefaults.standard.set(browserProfiles, forKey: "accountBrowserProfiles") }
+    }
+
+    /// Opens a github.com link in the Chrome profile set for the repo's account (the default
+    /// account for links outside a repo), else in the default browser.
+    func openInBrowser(_ url: URL) {
+        var login = accounts.usable.first?.id
+        let parts = url.pathComponents.filter { $0 != "/" }
+        if url.host?.lowercased() == "github.com", parts.count >= 2,
+           let account = account(for: parts[0] + "/" + parts[1]) {
+            login = account.id
+        }
+        if let login, let profile = browserProfiles[login], ChromeProfiles.open(url, profile: profile) { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Opens the Settings scene (works on macOS 14 without `openSettings`).
+    static func openSettingsWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    }
 }
 
 struct RepoGroup: Codable, Identifiable, Equatable {

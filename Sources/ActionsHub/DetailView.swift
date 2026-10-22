@@ -8,17 +8,244 @@ import AppKit
 
     var body: some View {
         let (rows, cols) = model.layout
-        VStack(spacing: 0) {
-            ForEach(0..<rows, id: \.self) { r in
-                if r > 0 { Divider() }
-                HStack(spacing: 0) {
-                    ForEach(0..<cols, id: \.self) { c in
-                        if c > 0 { Divider() }
-                        PaneView(index: r * cols + c)
-                    }
-                }
+        PaneGrid(rows: rows, cols: cols) {
+            ForEach(0..<rows * cols, id: \.self) { i in
+                PaneView(index: i)
             }
         }
+        .background(GridLines(rows: rows, cols: cols).fill(Color(nsColor: .separatorColor)))
+    }
+}
+
+/// A run row's top line: fixed items at their natural size (measured once and cached),
+/// the `Flexible` item (title and details) gets the width that's left, and the items after
+/// it sit at the trailing edge. Top-aligned. An HStack with a Spacer re-negotiated every
+/// child several times per frame while resizing.
+struct RunRowLayout: Layout {
+    var spacing: CGFloat
+    /// Minimum room between the flexible item and the trailing items.
+    var trailingGap: CGFloat
+
+    struct Flexible: LayoutValueKey { static let defaultValue = false }
+
+    struct Cache {
+        var sizes: [CGSize?]   // nil for the flexible item
+        var flexible: Int?
+    }
+
+    func makeCache(subviews: Subviews) -> Cache {
+        let flexible = subviews.firstIndex { $0[Flexible.self] }
+        return Cache(sizes: subviews.indices.map { $0 == flexible ? nil : subviews[$0].sizeThatFits(.unspecified) },
+                     flexible: flexible)
+    }
+
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
+        cache = makeCache(subviews: subviews)
+    }
+
+    /// Width left for the flexible item.
+    private func flexWidth(_ total: CGFloat, _ cache: Cache) -> CGFloat {
+        let fixed = cache.sizes.compactMap { $0?.width }
+        let gaps = spacing * CGFloat(max(fixed.count - 1, 0)) + (cache.flexible == nil ? 0 : spacing + trailingGap)
+        return max(0, total - fixed.reduce(0, +) - gaps)
+    }
+
+    private func flexSize(_ width: CGFloat?, _ subviews: Subviews, _ cache: Cache) -> CGSize {
+        guard let i = cache.flexible else { return .zero }
+        return subviews[i].sizeThatFits(ProposedViewSize(width: width.map { flexWidth($0, cache) }, height: nil))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
+        let flex = flexSize(proposal.width, subviews, cache)
+        let height = max(flex.height, cache.sizes.compactMap { $0?.height }.max() ?? 0)
+        if let width = proposal.width, width.isFinite { return CGSize(width: width, height: height) }
+        let fixed = cache.sizes.compactMap { $0?.width }
+        return CGSize(width: fixed.reduce(0, +) + flex.width + spacing * CGFloat(max(subviews.count - 1, 0)) + trailingGap,
+                      height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
+        let flexW = flexWidth(bounds.width, cache)
+        // Leading items and the flexible one from the left; trailing items from the right.
+        var x = bounds.minX
+        let leading = cache.flexible.map { 0...$0 } ?? 0...(subviews.count - 1)
+        for i in leading where subviews.indices.contains(i) {
+            let size = cache.sizes[i] ?? CGSize(width: flexW, height: bounds.height)
+            subviews[i].place(at: CGPoint(x: x, y: bounds.minY), proposal: ProposedViewSize(width: size.width, height: cache.sizes[i]?.height))
+            x += size.width + spacing
+        }
+        guard let flexible = cache.flexible, flexible + 1 < subviews.count else { return }
+        var right = bounds.maxX
+        for i in stride(from: subviews.count - 1, to: flexible, by: -1) {
+            let size = cache.sizes[i] ?? .zero
+            right -= size.width
+            subviews[i].place(at: CGPoint(x: right, y: bounds.minY), proposal: ProposedViewSize(size))
+            right -= spacing
+        }
+    }
+}
+
+/// One line of run details that drops whole details when it runs out of room, instead of
+/// squashing them: tier 2 goes first, then tier 1; if even tier 0 doesn't fit, the
+/// `Squeezable` item (the branch) is truncated. Natural widths are measured once and cached,
+/// so a resize only adds up numbers. ViewThatFits with one variant per tier re-measured
+/// every variant of every row on each frame, about 30 ms per frame with a 4x3 grid.
+struct MetaLine: Layout {
+    var spacing: CGFloat
+
+    /// 0: always shown; higher tiers are dropped first.
+    struct Tier: LayoutValueKey { static let defaultValue = 0 }
+    /// Truncated to fit when even the tier-0 items don't.
+    struct Squeezable: LayoutValueKey { static let defaultValue = false }
+
+    struct Cache {
+        var sizes: [CGSize]
+        var tiers: [Int]
+        var height: CGFloat
+    }
+
+    func makeCache(subviews: Subviews) -> Cache {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        return Cache(sizes: sizes, tiers: subviews.map { $0[Tier.self] }, height: sizes.map(\.height).max() ?? 0)
+    }
+
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
+        cache = makeCache(subviews: subviews)
+    }
+
+    /// Which items to show, and whether the squeezable one must shrink to fit `width`.
+    private func plan(_ width: CGFloat?, _ subviews: Subviews, _ cache: Cache) -> (shown: [Bool], squeeze: Bool) {
+        let tiers = cache.tiers
+        for maxTier in [2, 1, 0] {
+            let shown = tiers.map { $0 <= maxTier }
+            guard let width else { return (shown, false) }
+            if naturalWidth(shown, cache) <= width { return (shown, false) }
+        }
+        return (tiers.map { $0 == 0 }, true)
+    }
+
+    private func naturalWidth(_ shown: [Bool], _ cache: Cache) -> CGFloat {
+        let widths = zip(shown, cache.sizes).filter(\.0).map(\.1.width)
+        return widths.reduce(0, +) + spacing * CGFloat(max(widths.count - 1, 0))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
+        let (shown, squeeze) = plan(proposal.width, subviews, cache)
+        // With nothing to truncate, the tier-0 items are as narrow as it gets.
+        let canSqueeze = squeeze && subviews.contains { $0[Squeezable.self] }
+        let width = canSqueeze ? (proposal.width ?? 0) : naturalWidth(shown, cache)
+        return CGSize(width: width, height: cache.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
+        let (shown, squeeze) = plan(bounds.width, subviews, cache)
+        let overflow = squeeze ? naturalWidth(shown, cache) - bounds.width : 0
+        var x = bounds.minX
+        for (i, subview) in subviews.enumerated() {
+            var size = cache.sizes[i]
+            guard shown[i] else {
+                // Dropped: parked outside the row, where the scroll view clips it away.
+                subview.place(at: CGPoint(x: bounds.maxX + 10_000, y: bounds.minY), proposal: ProposedViewSize(size))
+                continue
+            }
+            if overflow > 0, subview[Squeezable.self] { size.width = max(0, size.width - overflow) }
+            subview.place(at: CGPoint(x: x, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(size))
+            x += size.width + spacing
+        }
+    }
+}
+
+/// Pane header: swatch, repo name over a details line, buttons on the right. The name gets
+/// its full width first, then the buttons (MetaLine drops the least useful ones), and the
+/// details line truncates into what's left. Stacks gave the details line equal say, so a
+/// long details line truncated the name (#11).
+struct PaneHeaderLayout: Layout {
+    var spacing: CGFloat
+    var lineSpacing: CGFloat
+
+    // Subviews: swatch, name, details, buttons.
+    private struct Plan { var swatch, name, details, buttons: CGSize }
+
+    private func plan(_ width: CGFloat?, _ subviews: Subviews) -> Plan {
+        let swatch = subviews[0].sizeThatFits(.unspecified)
+        let name = subviews[1].sizeThatFits(.unspecified)
+        let details = subviews[2].sizeThatFits(.unspecified)
+        guard let width else {
+            let buttons = subviews[3].sizeThatFits(.unspecified)
+            return Plan(swatch: swatch, name: name, details: details, buttons: buttons)
+        }
+        let room = max(0, width - swatch.width - 2 * spacing)
+        let buttons = subviews[3].sizeThatFits(ProposedViewSize(width: max(0, room - name.width), height: nil))
+        let text = max(0, room - buttons.width)
+        return Plan(swatch: swatch,
+                    name: CGSize(width: min(name.width, text), height: name.height),
+                    details: CGSize(width: min(details.width, text), height: details.height),
+                    buttons: buttons)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let p = plan(proposal.width, subviews)
+        let width = proposal.width ?? (p.swatch.width + max(p.name.width, p.details.width) + p.buttons.width + 2 * spacing)
+        let height = max(p.swatch.height, p.name.height + lineSpacing + p.details.height, p.buttons.height)
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let p = plan(bounds.width, subviews)
+        subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(p.swatch))
+        let x = bounds.minX + p.swatch.width + spacing
+        let top = bounds.midY - (p.name.height + lineSpacing + p.details.height) / 2
+        subviews[1].place(at: CGPoint(x: x, y: top), proposal: ProposedViewSize(p.name))
+        subviews[2].place(at: CGPoint(x: x, y: top + p.name.height + lineSpacing), proposal: ProposedViewSize(p.details))
+        subviews[3].place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(p.buttons))
+    }
+}
+
+/// Equal grid that proposes each pane its exact cell size, once. Nested HStack/VStack with
+/// flexible panes measured every pane several times per layout pass, which made resizing a
+/// big grid drop well below 60 fps.
+struct PaneGrid: Layout {
+    let rows: Int
+    let cols: Int
+    /// Room between cells for the 1 pt divider lines.
+    static let gap: CGFloat = 1
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let cell = Self.cellSize(in: bounds.size, rows: rows, cols: cols)
+        for (i, subview) in subviews.enumerated() {
+            let (r, c) = (i / cols, i % cols)
+            subview.place(at: CGPoint(x: bounds.minX + CGFloat(c) * (cell.width + Self.gap),
+                                      y: bounds.minY + CGFloat(r) * (cell.height + Self.gap)),
+                          proposal: ProposedViewSize(cell))
+        }
+    }
+
+    static func cellSize(in size: CGSize, rows: Int, cols: Int) -> CGSize {
+        CGSize(width: max(0, (size.width - gap * CGFloat(cols - 1)) / CGFloat(cols)),
+               height: max(0, (size.height - gap * CGFloat(rows - 1)) / CGFloat(rows)))
+    }
+}
+
+/// The divider lines between `PaneGrid` cells, as one shape.
+struct GridLines: Shape {
+    let rows: Int
+    let cols: Int
+
+    func path(in rect: CGRect) -> Path {
+        let cell = PaneGrid.cellSize(in: rect.size, rows: rows, cols: cols)
+        let gap = PaneGrid.gap
+        var path = Path()
+        for c in 1..<max(cols, 1) {
+            path.addRect(CGRect(x: rect.minX + CGFloat(c) * (cell.width + gap) - gap, y: rect.minY, width: gap, height: rect.height))
+        }
+        for r in 1..<max(rows, 1) {
+            path.addRect(CGRect(x: rect.minX, y: rect.minY + CGFloat(r) * (cell.height + gap) - gap, width: rect.width, height: gap))
+        }
+        return path
     }
 }
 
@@ -40,7 +267,10 @@ import AppKit
                 EmptyPane(index: index)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Exactly the cell's size even when the content is wider (min 0), clipped to it, so a
+        // narrow pane never paints over its neighbours.
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .topLeading)
+        .clipped()
         .overlay {
             if focused {
                 Rectangle().strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 2 * z).allowsHitTesting(false)
@@ -227,56 +457,63 @@ import AppKit
     }
 
     private var header: some View {
-        HStack(spacing: 12 * z) {
+        PaneHeaderLayout(spacing: 12 * z, lineSpacing: 2 * z) {
             ColorSwatch(repo: repo)
-            VStack(alignment: .leading, spacing: 2 * z) {
-                Text(repo.split(separator: "/").last.map(String.init) ?? repo)
-                    .zFont(.title3, weight: .semibold).lineLimit(1)
-                    .help(repo)
-                TimelineView(.periodic(from: .now, by: 5)) { _ in
-                    Text("\(repo.split(separator: "/").first ?? "") · " + (model.lastUpdated[repo].map { "updated \(Format.ago($0))" } ?? "loading…"))
-                        .zFont(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
+            Text(repo.split(separator: "/").last.map(String.init) ?? repo)
+                .zFont(.title3, weight: .semibold).lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .help(repo)
+            TimelineView(.periodic(from: .now, by: 5)) { _ in
+                Text("\(repo.split(separator: "/").first ?? "") · "
+                     + (model.multiAccount ? (model.account(for: repo).map { "@\($0.login) · " } ?? "") : "")
+                     + (model.lastUpdated[repo].map { "updated \(Format.ago($0))" } ?? "loading…"))
+                    .zFont(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            Spacer()
-            Button { showFilter.toggle() } label: {
-                ViewThatFits(in: .horizontal) {
+            MetaLine(spacing: 4 * z) {
+                Button { showFilter.toggle() } label: {
                     HStack(spacing: 4 * z) {
-                        Image(systemName: "line.3.horizontal.decrease")
-                        Text(filter ?? "All workflows")
-                        Image(systemName: "chevron.down").zFont(.caption2)
-                    }
-                    .fixedSize()
-                    Image(systemName: filter == nil ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
-                }
-                .zFont(.callout)
-            }
-            .buttonStyle(.borderless)
-            .frame(maxWidth: 180 * z)
-            .popover(isPresented: $showFilter, arrowEdge: .bottom) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach([nil] + workflowNames.map(Optional.some), id: \.self) { name in
-                        FilterOption(title: name ?? "All workflows", checked: filter == name) {
-                            model.workflowFilter[repo] = name
-                            showFilter = false
+                        Image(systemName: filter == nil ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
+                        if let filter {
+                            Text(filter).lineLimit(1).frame(maxWidth: 140 * z)
                         }
-                        if name == nil { Divider().padding(.vertical, 4 * z) }
+                    }
+                    .frame(height: 22 * z)
+                    .zFont(.callout)
+                }
+                .buttonStyle(.borderless)
+                .help(filter.map { "Showing \($0) only" } ?? "Filter by workflow")
+                // An active filter matters more than the buttons that have shortcuts.
+                .layoutValue(key: MetaLine.Tier.self, value: filter == nil ? 2 : 1)
+                .popover(isPresented: $showFilter, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach([nil] + workflowNames.map(Optional.some), id: \.self) { name in
+                            FilterOption(title: name ?? "All workflows", checked: filter == name) {
+                                model.workflowFilter[repo] = name
+                                showFilter = false
+                            }
+                            if name == nil { Divider().padding(.vertical, 4 * z) }
+                        }
+                    }
+                    .padding(6 * z)
+                    .zFont(.body)
+                    .environment(\.zoom, z)
+                }
+                HeaderButton(symbol: model.isPinned(repo) ? "pin.fill" : "pin", help: model.isPinned(repo) ? "Remove from group (⌘D)" : "Add to group (⌘D)") { model.togglePin(repo) }
+                    .layoutValue(key: MetaLine.Tier.self, value: 2)
+                Group {
+                    if model.runsLoading.contains(repo) {
+                        ProgressView().controlSize(.small).frame(width: 22 * z)
+                    } else {
+                        HeaderButton(symbol: "arrow.clockwise", help: "Refresh (⌘R)") { Task { await model.refreshRuns(repo) } }
                     }
                 }
-                .padding(6 * z)
-                .zFont(.body)
-                .environment(\.zoom, z)
-            }
-            HeaderButton(symbol: model.isPinned(repo) ? "pin.fill" : "pin", help: model.isPinned(repo) ? "Remove from group (⌘D)" : "Add to group (⌘D)") { model.togglePin(repo) }
-            if model.runsLoading.contains(repo) {
-                ProgressView().controlSize(.small).frame(width: 22 * z)
-            } else {
-                HeaderButton(symbol: "arrow.clockwise", help: "Refresh (⌘R)") { Task { await model.refreshRuns(repo) } }
-            }
-            PRLinkButton(repo: repo)
-            HeaderButton(symbol: "safari", help: "Open in browser (⇧⌘O)") { model.openInBrowser(model.url(for: repo)) }
-            if model.isSinglePane {
-                HeaderButton(symbol: "xmark", help: "Clear this pane") { model.clearPane(pane) }
+                .layoutValue(key: MetaLine.Tier.self, value: 1)
+                PRLinkButton(repo: repo)
+                    .layoutValue(key: MetaLine.Tier.self, value: 1)
+                HeaderButton(symbol: "safari", help: "Open in browser (⇧⌘O)") { model.openInBrowser(model.url(for: repo)) }
+                if model.isSinglePane {
+                    HeaderButton(symbol: "xmark", help: "Clear this pane") { model.clearPane(pane) }
+                }
             }
         }
         .padding(.horizontal, 16 * z)
@@ -457,29 +694,34 @@ import AppKit
 
     private var expanded: Bool { model.expandedRuns.contains(run.id) }
 
-    private func metaLine(workflow: Bool, extras: Bool) -> some View {
-        HStack(spacing: 6 * z) {
-            if workflow { Text(run.workflowLabel) }
+    /// Workflow, run number, branch and extras on one line. Narrow panes drop details instead
+    /// of squashing them (see `MetaLine`).
+    private var metaLine: some View {
+        MetaLine(spacing: 6 * z) {
+            Text(run.workflowLabel).layoutValue(key: MetaLine.Tier.self, value: 1)
             Text("#\(run.runNumber)")
-            if extras, let attempt = run.runAttempt, attempt > 1 { Text("attempt \(attempt)") }
+            if let attempt = run.runAttempt, attempt > 1 {
+                Text("attempt \(attempt)").layoutValue(key: MetaLine.Tier.self, value: 2)
+            }
             if let branch = run.headBranch {
                 Text(branch)
                     .zFont(.caption, design: .monospaced)
+                    .truncationMode(.middle)
                     .padding(.horizontal, 5 * z)
                     .padding(.vertical, 1 * z)
                     .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+                    .layoutValue(key: MetaLine.Squeezable.self, value: true)
             }
-            if extras {
-                Text(run.event)
-                if let actor = run.actor { Text("· \(actor.login)") }
+            Text(run.event).layoutValue(key: MetaLine.Tier.self, value: 2)
+            if let actor = run.actor {
+                Text("· \(actor.login)").layoutValue(key: MetaLine.Tier.self, value: 2)
             }
         }
-        .fixedSize()
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 10 * z) {
+            RunRowLayout(spacing: 10 * z, trailingGap: 8 * z) {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
                     .zFont(.caption2, weight: .bold)
                     .foregroundStyle(.tertiary)
@@ -491,30 +733,12 @@ import AppKit
                     Text(run.title)
                         .fontWeight(.medium)
                         .lineLimit(1)
-                    // Narrow panes drop details instead of squashing them: the fullest
-                    // variant that fits wins.
-                    ViewThatFits(in: .horizontal) {
-                        metaLine(workflow: true, extras: true)
-                        metaLine(workflow: true, extras: false)
-                        metaLine(workflow: false, extras: false)
-                        // Last resort (always used if nothing above fits): trim the branch in the middle.
-                        HStack(spacing: 6 * z) {
-                            Text("#\(run.runNumber)").fixedSize()
-                            if let branch = run.headBranch {
-                                Text(branch)
-                                    .zFont(.caption, design: .monospaced)
-                                    .truncationMode(.middle)
-                                    .padding(.horizontal, 5 * z)
-                                    .padding(.vertical, 1 * z)
-                                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
-                            }
-                        }
-                    }
+                    metaLine
                     .lineLimit(1)
                     .zFont(.caption)
                     .foregroundStyle(.secondary)
                 }
-                Spacer(minLength: 8 * z)
+                .layoutValue(key: RunRowLayout.Flexible.self, value: true)
                 VStack(alignment: .trailing, spacing: 3 * z) {
                     Text(Format.ago(run.createdAt)).zFont(.caption)
                     if run.state == .waiting {
@@ -621,10 +845,113 @@ import AppKit
     let state: RunState
 
     var body: some View {
-        Image(systemName: state.symbol)
-            .foregroundStyle(state.color)
-            .symbolEffect(.pulse, isActive: state == .running)
-            .help(state.label)
+        Group {
+            if state == .running {
+                // A plain partial ring reads as "spinning" far better than rotating a
+                // symmetric symbol. Sized by an invisible symbol so it matches the font/zoom.
+                Image(systemName: "circle")
+                    .hidden()
+                    .overlay {
+                        SpinnerRing(color: state.color, lineWidth: 2 * z)
+                            .padding(1.5 * z)
+                    }
+            } else {
+                Image(systemName: state.symbol)
+                    .foregroundStyle(state.color)
+            }
+        }
+        .help(state.label)
+    }
+}
+
+/// Partial ring rotated by Core Animation. The render server runs the rotation, so any
+/// number of running icons cost the main thread nothing per frame. (A SwiftUI TimelineView
+/// spinner re-rendered and re-laid-out the whole window at 30 fps per icon.) CA animations
+/// also ignore Reduce Motion, so it keeps spinning.
+struct SpinnerRing: NSViewRepresentable {
+    let color: Color
+    let lineWidth: CGFloat
+    var period: Double = 1.2
+
+    func makeNSView(context: Context) -> RingView { RingView() }
+
+    func updateNSView(_ view: RingView, context: Context) {
+        view.configure(color: NSColor(color), lineWidth: lineWidth, period: period)
+    }
+
+    final class RingView: NSView {
+        private let ring = CAShapeLayer()
+        private var color = NSColor.systemOrange
+        private var period = 1.2
+        private static let key = "spin"
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            ring.fillColor = nil
+            ring.lineCap = .round
+            ring.strokeEnd = 0.7
+            layer?.addSublayer(ring)
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+        /// Clicks and hover go to the SwiftUI views around it.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        func configure(color: NSColor, lineWidth: CGFloat, period: Double) {
+            self.color = color
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            applyColor()
+            if ring.lineWidth != lineWidth { ring.lineWidth = lineWidth; needsLayout = true }
+            CATransaction.commit()
+            // Only restart the rotation when its speed changes, or it would jump on every update.
+            if period != self.period {
+                self.period = period
+                ring.removeAnimation(forKey: Self.key)
+            }
+            startIfNeeded()
+        }
+
+        override func layout() {
+            super.layout()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            ring.frame = bounds
+            let inset = ring.lineWidth / 2
+            ring.path = CGPath(ellipseIn: bounds.insetBy(dx: inset, dy: inset), transform: nil)
+            CATransaction.commit()
+        }
+
+        /// Core Animation drops a layer's animations when it leaves the window.
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            startIfNeeded()
+        }
+
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            applyColor()
+            CATransaction.commit()
+        }
+
+        private func applyColor() {
+            effectiveAppearance.performAsCurrentDrawingAppearance { ring.strokeColor = color.cgColor }
+        }
+
+        private func startIfNeeded() {
+            guard window != nil, ring.animation(forKey: Self.key) == nil else { return }
+            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+            spin.fromValue = 0
+            spin.toValue = -2 * Double.pi   // clockwise: AppKit layers have y pointing up
+            spin.duration = period
+            spin.repeatCount = .infinity
+            spin.isRemovedOnCompletion = false
+            ring.add(spin, forKey: Self.key)
+        }
     }
 }
 
